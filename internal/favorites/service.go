@@ -87,7 +87,7 @@ func (s Service) List(ctx context.Context, opts QueryOptions) ([]Item, error) {
 	}
 	if _, err := os.Stat(s.CacheDB); err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("favorite cache does not exist: run `sudo wxview init` and retry")
+			return nil, fmt.Errorf("favorite cache does not exist: run `wxview init` with process-memory permissions and retry")
 		}
 		return nil, err
 	}

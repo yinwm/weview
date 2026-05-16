@@ -63,7 +63,7 @@ func (s Service) List(ctx context.Context, opts QueryOptions) ([]Session, error)
 	}
 	if _, err := os.Stat(s.CacheDB); err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("session cache does not exist: run `sudo wxview init` and then `wxview sessions --refresh`")
+			return nil, fmt.Errorf("session cache does not exist: run `wxview init` with process-memory permissions and then `wxview sessions --refresh`")
 		}
 		return nil, err
 	}

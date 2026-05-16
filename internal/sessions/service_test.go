@@ -76,6 +76,9 @@ INSERT INTO SessionAbstract(m_nsUserName, m_uUnReadCount, m_uLastTime) VALUES ('
 
 func runSQLite(t *testing.T, path string, sql string) {
 	t.Helper()
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 is required for session query tests")
+	}
 	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
 		t.Fatalf("sqlite failed: %v: %s", err, out)
 	}

@@ -15,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -98,7 +97,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `wxview - Read local WeChat data
 
-Wxview is a local-first CLI for reading macOS WeChat 4.x data from the
+Wxview is a local-first CLI for reading macOS and Windows WeChat 4.x data from the
 user's own machine. It can obtain database keys, decrypt local WeChat
 databases into ~/.wxview/cache, list contacts or contact-table groups, and
 query message history for an explicit username.
@@ -122,7 +121,7 @@ Commands:
   wxview help CMD   Show detailed help for a command.
 
 Common examples:
-  sudo wxview init
+  wxview init
   wxview contacts --format json
   wxview contacts --kind friend --format jsonl
   wxview contacts --kind friend --format csv
@@ -155,7 +154,7 @@ Machine-readable usage:
   Use --kind chatroom for groups present in the contact table.
 
 Current scope:
-  Supported: macOS WeChat 4.x contact/contact.db, message/message_*.db,
+  Supported: macOS and Windows WeChat 4.x contact/contact.db, message/message_*.db,
              selected optional data DBs such as favorite/favorite.db,
              sns/sns.db, and message/biz_message_*.db when keys are available.
              Message history reads by explicit username include local image/video
@@ -217,8 +216,8 @@ func initUsage(w io.Writer) {
 	fmt.Fprintln(w, `wxview init - First-time setup for reading local WeChat data
 
 Usage:
-  sudo wxview init [--verbose]
-  sudo go run ./cmd/wxview init [--verbose]
+  wxview init [--verbose]
+  go run ./cmd/wxview init [--verbose]
 
 When to run:
   Run this at the beginning before using contacts/daemon.
@@ -227,8 +226,10 @@ When to run:
   reinstalled/updated in a way that changes the database key.
 
 What it does:
-  1. Detects the current macOS WeChat 4.x account under:
+  1. Detects the current WeChat 4.x account under macOS:
      ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<account>/db_storage
+     or Windows:
+     <data-root>\xwechat_files\<account>\db_storage
   2. Finds required databases:
      contact/contact.db
      message/message_[number].db
@@ -242,7 +243,8 @@ What it does:
      ~/.wxview/cache/<account>/keys.json with mode 0600.
 
 Required DB key failures stop init. Auxiliary message DB failures are reported
-as warnings and can be retried later with sudo wxview init.
+as warnings and can be retried later with wxview init. On macOS this usually
+means running with sudo; on Windows run the terminal as Administrator.
 
 Output fields:
   account       WeChat account directory name.
@@ -257,9 +259,11 @@ Flags:
 
 Notes:
   The full key is never printed, even with --verbose.
-  Key scanning needs WeChat running and macOS permission to read its process
-  memory. On Hardened Runtime WeChat builds, sudo alone may not be enough; use a
-  local GUI terminal with Developer Tools permission or ad-hoc re-sign WeChat.`)
+  Key scanning needs WeChat running and permission to read its process memory.
+  On macOS Hardened Runtime WeChat builds, sudo alone may not be enough; use a
+  local GUI terminal with Developer Tools permission or ad-hoc re-sign WeChat.
+  On Windows, run from an elevated terminal. If automatic path detection fails,
+  set WXVIEW_WECHAT_DB_STORAGE to the account db_storage directory.`)
 }
 
 const (
@@ -594,7 +598,8 @@ Runtime behavior:
   Image and video messages in the returned page are resolved to local files
   automatically. WeChat .dat images and recognizable .dat videos are decoded
   or normalized into ~/.wxview/cache/<account>/media/.
-  If a required message DB key is missing, run sudo wxview init first.`)
+  If a required message DB key is missing, run wxview init with process-memory
+  permissions first.`)
 }
 
 func searchUsage(w io.Writer) {
@@ -898,7 +903,7 @@ func runDaemonForeground(stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), daemonSignals()...)
 	defer stop()
 
 	fmt.Fprintf(stdout, "daemon socket: %s\n", socketPath)
@@ -951,7 +956,7 @@ func runDaemonStart(args []string, stdout io.Writer) error {
 	cmd.Env = append(os.Environ(), daemonForegroundEnv+"=1")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = daemonSysProcAttr()
 	if err := cmd.Start(); err != nil {
 		return err
 	}

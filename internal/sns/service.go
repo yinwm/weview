@@ -230,7 +230,7 @@ func (s Service) ensureCache() error {
 	}
 	if _, err := os.Stat(s.CacheDB); err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("sns cache does not exist: run `sudo wxview init` and retry")
+			return fmt.Errorf("sns cache does not exist: run `wxview init` with process-memory permissions and retry")
 		}
 		return err
 	}

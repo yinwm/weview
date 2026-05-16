@@ -51,7 +51,7 @@ func TestInitOutputDefaultsToSummary(t *testing.T) {
 	}
 	warnings := []key.EnsureWarning{{
 		DBRelPath: "message/message_revoke.db",
-		Message:   "auxiliary key missing; skipped. Retry later with `sudo wxview init`.",
+		Message:   "auxiliary key missing; skipped. Retry later with `wxview init` and process-memory permissions.",
 	}}
 
 	var out bytes.Buffer

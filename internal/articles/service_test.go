@@ -99,6 +99,7 @@ type articleMessageRow struct {
 
 func createArticleContactDB(t *testing.T, path string, inserts string) {
 	t.Helper()
+	requireSQLite3(t)
 	sql := `
 CREATE TABLE contact (
   username TEXT,
@@ -117,6 +118,7 @@ CREATE TABLE contact (
 
 func createArticleMessageDB(t *testing.T, path string, table string, rows []articleMessageRow) {
 	t.Helper()
+	requireSQLite3(t)
 	sql := fmt.Sprintf(`
 CREATE TABLE [%s] (
   local_id INTEGER PRIMARY KEY,
@@ -150,4 +152,11 @@ INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (2, 'self_user', 0);
 
 func sqlQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func requireSQLite3(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 is required for article query tests")
+	}
 }

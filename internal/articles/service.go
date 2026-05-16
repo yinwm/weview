@@ -113,7 +113,7 @@ func (s Service) List(ctx context.Context, opts QueryOptions) ([]Article, error)
 		return nil, fmt.Errorf("limit and offset must be >= 0")
 	}
 	if len(s.MessageDBs) == 0 {
-		return nil, fmt.Errorf("message cache does not exist: run `sudo wxview init` and retry")
+		return nil, fmt.Errorf("message cache does not exist: run `wxview init` with process-memory permissions and retry")
 	}
 	accounts, err := s.selectedAccounts(ctx, opts)
 	if err != nil {

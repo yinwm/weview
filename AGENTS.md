@@ -1,6 +1,7 @@
 # Agent Notes for Wxview
 
-Wxview is a local-first CLI for reading data from the user's own macOS WeChat.
+Wxview is a local-first CLI for reading data from the user's own macOS or
+Windows WeChat.
 The V1 implementation is intentionally narrow: initialize supported DB keys,
 decrypt `contact/contact.db`, `session/session.db`, message-related DBs, and
 selected optional data DBs, run a local daemon for cache maintenance, list
@@ -30,6 +31,9 @@ paths automatically when the supporting caches are available.
   rather than block init.
 - `wxview init` should be concise by default: print account, data_dir, key
   counts, and warnings. Per-DB fingerprints/status belong behind `--verbose`.
+- On Windows, account discovery reads `%APPDATA%\Tencent\xwechat\config\*.ini`
+  and searches `xwechat_files\<account>\db_storage`. `WXVIEW_WECHAT_DB_STORAGE`
+  may point directly at a `db_storage` directory when auto-detection fails.
 - Current account detection should prefer the account whose `db_storage` files
   are currently open by the running WeChat process. File mtime is only a
   fallback when open-file detection cannot identify an account.
@@ -124,7 +128,8 @@ paths automatically when the supporting caches are available.
   `thumbnail_path`, `thumbnail_source_path`, `thumbnail_decoded`, `width`,
   `height`, and `media_reason` when available.
 - `wxview messages` must not scan WeChat process memory. If a message key is
-  missing or invalid, tell the user to run `sudo wxview init`.
+  missing or invalid, tell the user to run `wxview init` with process-memory
+  permissions (`sudo` on macOS, Administrator terminal on Windows).
 
 ## Contact Output Contract
 

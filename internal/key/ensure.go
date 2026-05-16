@@ -33,7 +33,7 @@ type MissingKeyError struct {
 }
 
 func (e MissingKeyError) Error() string {
-	return fmt.Sprintf("missing key for %s; run `sudo wxview init`", e.DBRelPath)
+	return fmt.Sprintf("missing key for %s; run `wxview init` with process-memory permissions", e.DBRelPath)
 }
 
 func IsMissingKeyError(err error) bool {
@@ -73,7 +73,7 @@ func EnsureSupportedKeys(ctx context.Context) (EnsureKeysResult, error) {
 		if err != nil {
 			warnings = append(warnings, EnsureWarning{
 				DBRelPath: target.DBRelPath,
-				Message:   "auxiliary key missing; skipped. Retry later with `sudo wxview init`.",
+				Message:   "auxiliary key missing; skipped. Retry later with `wxview init` and process-memory permissions.",
 			})
 			continue
 		}
@@ -84,7 +84,7 @@ func EnsureSupportedKeys(ctx context.Context) (EnsureKeysResult, error) {
 		if err != nil {
 			warnings = append(warnings, EnsureWarning{
 				DBRelPath: target.DBRelPath,
-				Message:   "optional data key missing; skipped. Retry later with `sudo wxview init`.",
+				Message:   "optional data key missing; skipped. Retry later with `wxview init` and process-memory permissions.",
 			})
 			continue
 		}
@@ -362,7 +362,7 @@ func ensureMessageAuxCachesBestEffort(ctx context.Context) []EnsureWarning {
 		if _, _, err := EnsureDBCache(ctx, target); err != nil {
 			warnings = append(warnings, EnsureWarning{
 				DBRelPath: target.DBRelPath,
-				Message:   "auxiliary DB cache skipped; run `sudo wxview init` again if this DB becomes needed",
+				Message:   "auxiliary DB cache skipped; run `wxview init` with process-memory permissions again if this DB becomes needed",
 			})
 		}
 	}
@@ -379,7 +379,7 @@ func ensureBizMessageCachesBestEffort(ctx context.Context) []EnsureWarning {
 		if _, _, err := EnsureDBCache(ctx, target); err != nil {
 			warnings = append(warnings, EnsureWarning{
 				DBRelPath: target.DBRelPath,
-				Message:   "biz message DB cache skipped; run `sudo wxview init` again if this DB becomes needed",
+				Message:   "biz message DB cache skipped; run `wxview init` with process-memory permissions again if this DB becomes needed",
 			})
 		}
 	}
@@ -396,7 +396,7 @@ func ensureMediaCachesBestEffort(ctx context.Context) []EnsureWarning {
 		if _, _, err := EnsureDBCache(ctx, target); err != nil {
 			warnings = append(warnings, EnsureWarning{
 				DBRelPath: target.DBRelPath,
-				Message:   "media DB cache skipped; run `sudo wxview init` again if voice media becomes needed",
+				Message:   "media DB cache skipped; run `wxview init` with process-memory permissions again if voice media becomes needed",
 			})
 		}
 	}

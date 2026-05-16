@@ -10,6 +10,7 @@ import (
 func TestCacheMetadataFreshness(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	sourcePath := filepath.Join(home, "source.db")
 	cachePath := filepath.Join(home, ".wxview", "cache", "wxid_a", "message", "message_0.db")
@@ -65,6 +66,7 @@ func TestCacheMetadataFreshness(t *testing.T) {
 func TestCacheMetadataMissingCacheIsStale(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	sourcePath := filepath.Join(home, "source.db")
 	cachePath := filepath.Join(home, ".wxview", "cache", "wxid_a", "message", "message_0.db")

@@ -111,6 +111,9 @@ type timelineMessageRow struct {
 
 func createTimelineMessageDB(t *testing.T, path string, table string, rows []timelineMessageRow) {
 	t.Helper()
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 is required for timeline query tests")
+	}
 	sql := fmt.Sprintf(`
 CREATE TABLE [%s] (
   local_id INTEGER PRIMARY KEY,

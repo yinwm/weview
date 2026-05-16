@@ -40,6 +40,7 @@ func TestSafeAccountDirSanitizesPathSeparators(t *testing.T) {
 func TestCacheDBPathCreatesAccountDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	got, err := CacheDBPath("a/b c", "keys.json")
 	if err != nil {

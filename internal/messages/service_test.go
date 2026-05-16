@@ -499,6 +499,7 @@ type messageRow struct {
 
 func createMessageDB(t *testing.T, path string, table string, rows []messageRow) {
 	t.Helper()
+	requireSQLite3(t)
 	sql := fmt.Sprintf(`
 CREATE TABLE [%s] (
   local_id INTEGER PRIMARY KEY,
@@ -586,6 +587,13 @@ func writePNGForTest(t *testing.T, path string, width int, height int) {
 	defer file.Close()
 	if err := png.Encode(file, img); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func requireSQLite3(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 is required for message query tests")
 	}
 }
 

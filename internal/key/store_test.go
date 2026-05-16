@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -26,7 +27,7 @@ func TestStoreFindByDataDirRelPathAndSalt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("keys.json mode = %o, want 0600", info.Mode().Perm())
 	}
 	var file storeFile
@@ -98,6 +99,7 @@ func TestLoadStoreGroupedFormat(t *testing.T) {
 func TestKeyStorePathIsAccountScoped(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	path, err := KeyStorePath("wxid/a b")
 	if err != nil {

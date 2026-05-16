@@ -129,7 +129,7 @@ import (
 	"unsafe"
 )
 
-func scanSQLCipherPragmaKey(pid int, saltHex string) (string, error) {
+func scanSQLCipherPragmaKey(pid int, saltHex string, _ []byte) (string, error) {
 	cSalt := C.CString(saltHex)
 	defer C.free(unsafe.Pointer(cSalt))
 

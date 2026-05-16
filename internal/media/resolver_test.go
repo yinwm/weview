@@ -171,6 +171,7 @@ func TestResolverAddsDirectVideoPathAndThumbnail(t *testing.T) {
 }
 
 func TestResolverFindsVideoFromResourceDB(t *testing.T) {
+	requireSQLite3(t)
 	dir := t.TempDir()
 	accountBase := filepath.Join(dir, "wxid_owner_bcc2")
 	dataDir := filepath.Join(accountBase, "db_storage")
@@ -226,6 +227,7 @@ func TestResolveFilePathMacOS4(t *testing.T) {
 }
 
 func TestResolveVoiceFromMediaDB(t *testing.T) {
+	requireSQLite3(t)
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "wxid_owner_bcc2", "db_storage")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -256,6 +258,7 @@ INSERT INTO VoiceInfo(chat_name_id, local_id, svr_id, voice_data) VALUES (9, 7, 
 }
 
 func TestResolveAvatarFromHeadImageDB(t *testing.T) {
+	requireSQLite3(t)
 	dir := t.TempDir()
 	headDB := filepath.Join(dir, "head_image.db")
 	sql := `
@@ -326,4 +329,11 @@ func writeTestMP4(t *testing.T, path string) {
 func testMP4Bytes() []byte {
 	data := []byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm'}
 	return append(data, []byte(fmt.Sprintf("%012d", 1))...)
+}
+
+func requireSQLite3(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 is required for media DB tests")
+	}
 }
