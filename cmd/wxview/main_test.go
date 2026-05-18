@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"wxview/internal/buildinfo"
 	"wxview/internal/contacts"
 	"wxview/internal/messages"
 	"wxview/internal/sessions"
@@ -190,6 +191,24 @@ func TestLocalTimezoneNamePrefersTZ(t *testing.T) {
 	t.Setenv("TZ", "Asia/Shanghai")
 	if got := localTimezoneName(); got != "Asia/Shanghai" {
 		t.Fatalf("timezone = %q, want Asia/Shanghai", got)
+	}
+}
+
+func TestDaemonStatusPrintsVersionWhenStopped(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var out bytes.Buffer
+	if err := run([]string{"daemon", "status"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{
+		"daemon socket:",
+		"version: " + buildinfo.String(),
+		"status: stopped",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("daemon status missing %q:\n%s", want, text)
+		}
 	}
 }
 

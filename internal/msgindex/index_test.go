@@ -1,0 +1,676 @@
+package msgindex
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"wxview/internal/messages"
+	"wxview/internal/timeline"
+)
+
+func TestBuildStatusAndMessageRefs(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db1 := filepath.Join(dir, "message_0.db")
+	db2 := filepath.Join(dir, "message_1.db")
+	createIndexMessageDB(t, db1, map[string][]indexMessageRow{
+		messages.TableName("alice"): {
+			{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "first"},
+			{LocalID: 3, SortSeq: 3001, CreateTime: 300, Status: 2, Content: "third"},
+		},
+	})
+	createIndexMessageDB(t, db2, map[string][]indexMessageRow{
+		messages.TableName("alice"): {
+			{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "second"},
+		},
+		messages.TableName("bob"): {
+			{LocalID: 4, SortSeq: 4001, CreateTime: 400, Status: 4, Content: "bob message"},
+		},
+	})
+
+	indexPath := filepath.Join(dir, "index.db")
+	result, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db1, db2},
+		ChatUsernames:     []string{"alice", "bob"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status.Status != StatusReady || result.Status.IndexedRows != 4 || result.Status.CoveredChats != 2 || result.Status.SourceDBCount != 2 {
+		t.Fatalf("unexpected build status: %+v", result.Status)
+	}
+
+	status, err := StatusFor(ctx, indexPath, []string{db1, db2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusReady || status.QueryMode != QueryModeIndex {
+		t.Fatalf("status = %+v, want ready index", status)
+	}
+
+	refs, err := MessageRefs(ctx, indexPath, MessageQuery{
+		Username: "alice",
+		Start:    100,
+		End:      300,
+		HasStart: true,
+		HasEnd:   true,
+		Limit:    2,
+		Offset:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := messages.NewService([]string{db1, db2}).ListByRefs(ctx, refs, messages.RefQueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Content != "second" || got[1].Content != "third" {
+		t.Fatalf("indexed page = %+v, want second then third", got)
+	}
+
+	scan, err := messages.NewService([]string{db1, db2}).List(ctx, messages.QueryOptions{
+		Username: "alice",
+		Start:    100,
+		End:      300,
+		HasStart: true,
+		HasEnd:   true,
+		Limit:    2,
+		Offset:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan) != len(got) || scan[0].ID != got[0].ID || scan[1].ID != got[1].ID {
+		t.Fatalf("fast path differs from scan: fast=%+v scan=%+v", got, scan)
+	}
+}
+
+func TestStatusLagPolicyAndSchemaMismatch(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		messages.TableName("alice"): {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "first"}},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	newTime := time.Now().Add(-2 * time.Second)
+	if err := os.Chtimes(db, newTime, newTime); err != nil {
+		t.Fatal(err)
+	}
+	status, err := StatusFor(ctx, indexPath, []string{db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusReady || status.QueryMode != QueryModeIndex || status.LagPolicy != "realtime_within_60s" {
+		t.Fatalf("status = %+v, want ready near-realtime index", status)
+	}
+
+	oldTime := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(db, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	status, err = StatusFor(ctx, indexPath, []string{db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusStale || status.QueryMode != QueryModeScan || status.Reason != "index_lag_exceeds_realtime_window" {
+		t.Fatalf("status = %+v, want stale lag fallback", status)
+	}
+
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", indexPath, "UPDATE meta SET value='999' WHERE key='schema_version';").CombinedOutput(); err != nil {
+		t.Fatalf("update schema version: %v: %s", err, out)
+	}
+	status, err = StatusFor(ctx, indexPath, []string{db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusSchemaMismatch {
+		t.Fatalf("status = %+v, want schema_mismatch", status)
+	}
+}
+
+func TestRefreshCatchesUpIncrementally(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	table := messages.TableName("alice")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		table: {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "first"}},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	insertIndexMessageRow(t, db, table, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "second"})
+
+	status, err := StatusFor(ctx, indexPath, []string{db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err = DetailedStatusFor(ctx, indexPath, []string{db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusStale || status.QueryMode != QueryModeScan {
+		t.Fatalf("status = %+v, want stale after source DB append beyond realtime window", status)
+	}
+	result, err := Refresh(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status.Status != StatusReady || result.Status.IndexedRows != 2 {
+		t.Fatalf("refresh result = %+v, want ready with 2 rows", result.Status)
+	}
+	refs, err := MessageRefs(ctx, indexPath, MessageQuery{Username: "alice", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := messages.NewService([]string{db}).ListByRefs(ctx, refs, messages.RefQueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Content != "first" || got[1].Content != "second" {
+		t.Fatalf("indexed rows after refresh = %+v, want first then second", got)
+	}
+}
+
+func TestRefreshResumesInterruptedIndexFromWatermark(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	table := messages.TableName("alice")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		table: {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "first"}},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if err := initializeIndexDB(ctx, indexPath, "wxid_test", StatusInterrupted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := indexTableIncrementalTx(ctx, indexPath, db, "message_0.db", table, "alice", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	insertIndexMessageRow(t, db, table, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "second"})
+
+	result, err := Refresh(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status.Status != StatusReady || result.Status.IndexedRows != 2 {
+		t.Fatalf("refresh result = %+v, want resumed ready index with 2 rows", result.Status)
+	}
+	refs, err := MessageRefs(ctx, indexPath, MessageQuery{Username: "alice", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := messages.NewService([]string{db}).ListByRefs(ctx, refs, messages.RefQueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Content != "first" || got[1].Content != "second" {
+		t.Fatalf("resumed rows = %+v, want first then second without duplicates", got)
+	}
+}
+
+func TestUseForQueryAllowsHistoricalRangeWhenIndexIsStale(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	table := messages.TableName("alice")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		table: {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "first"}},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	insertIndexMessageRow(t, db, table, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 500, Status: 4, Content: "new tail"})
+	old := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(db, old, old); err != nil {
+		t.Fatal(err)
+	}
+	usable, err := UseForQuery(ctx, indexPath, []string{db}, UsabilityOptions{
+		Username: "alice",
+		Start:    0,
+		End:      100,
+		HasStart: true,
+		HasEnd:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !usable.UseIndex {
+		t.Fatalf("historical query should still use index when covered: %+v", usable)
+	}
+	usable, err = UseForQuery(ctx, indexPath, []string{db}, UsabilityOptions{Username: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usable.UseIndex {
+		t.Fatalf("tail query should not use stale index: %+v", usable)
+	}
+}
+
+func TestStatusReportsBuildingProgress(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "messages.db")
+	tempPath := filepath.Join(dir, ".messages-123.db")
+	if err := os.WriteFile(tempPath, []byte("temporary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	progress := buildProgress{
+		Status:          StatusBuilding,
+		PID:             os.Getpid(),
+		StartedAt:       "2026-05-18T16:00:00+08:00",
+		UpdatedAt:       time.Now().Format(time.RFC3339),
+		Account:         "wxid_test",
+		IndexPath:       indexPath,
+		TempPath:        tempPath,
+		CurrentSourceDB: "message_0.db",
+		CurrentTable:    messages.TableName("alice"),
+		TotalSources:    2,
+		TotalTables:     4,
+		CompletedTables: 1,
+		TotalRows:       100,
+		IndexedRows:     25,
+		Percent:         25,
+	}
+	data, err := json.Marshal(progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobPathFor(indexPath), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := StatusFor(ctx, indexPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusBuilding || status.JobState != JobStateActive || status.ProgressPercent != 25 || status.ProgressRows != 25 || status.ProgressTotalRows != 100 {
+		t.Fatalf("status = %+v, want building progress", status)
+	}
+	if status.ProgressTables != 1 || status.ProgressTotalTables != 4 || !strings.Contains(status.ProgressCurrent, "message_0.db") {
+		t.Fatalf("status current/progress table fields not populated: %+v", status)
+	}
+}
+
+func TestStatusMergesProgressWithIndexStatsAndInterruptedJobState(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	table := messages.TableName("alice")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		table: {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "first"}},
+	})
+	indexPath := filepath.Join(dir, "messages.db")
+	if err := initializeIndexDB(ctx, indexPath, "wxid_test", StatusBuilding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := indexTableIncrementalTx(ctx, indexPath, db, "message_0.db", table, "alice", -1, nil); err != nil {
+		t.Fatal(err)
+	}
+	progress := buildProgress{
+		Status:      StatusBuilding,
+		PID:         os.Getpid(),
+		StartedAt:   time.Now().Format(time.RFC3339),
+		UpdatedAt:   time.Now().Format(time.RFC3339),
+		Account:     "wxid_test",
+		IndexPath:   indexPath,
+		TotalTables: 2,
+	}
+	data, err := json.Marshal(progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobPathFor(indexPath), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, err := StatusFor(ctx, indexPath, []string{db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.SchemaVersion != SchemaVersion || status.IndexedRows != 1 || status.ProgressRows != 1 || status.ProgressTables != 1 || status.CoveredChats != 1 {
+		t.Fatalf("status = %+v, want progress merged with real index stats", status)
+	}
+
+	MarkInterrupted(indexPath)
+	status, err = StatusFor(ctx, indexPath, []string{db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusInterrupted || status.JobState != JobStateInterrupted {
+		t.Fatalf("status = %+v, want interrupted job_state interrupted", status)
+	}
+}
+
+func TestCleanIndexTmpRemovesOrphansAndKeepsActiveTemp(t *testing.T) {
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "messages.db")
+	activeTmp := filepath.Join(dir, ".messages-active.db")
+	orphanTmp := filepath.Join(dir, ".messages-orphan.db")
+	if err := os.WriteFile(activeTmp, []byte("active"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphanTmp, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job := buildProgress{
+		Status:    StatusBuilding,
+		PID:       os.Getpid(),
+		UpdatedAt: time.Now().Format(time.RFC3339),
+		TempPath:  activeTmp,
+	}
+	data, err := json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobPathFor(indexPath), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := CleanIndexTmpResult(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 1 || result.Kept != 1 {
+		t.Fatalf("clean result = %+v, want one removed and one kept", result)
+	}
+	if _, err := os.Stat(activeTmp); err != nil {
+		t.Fatalf("active temp should be kept: %v", err)
+	}
+	if _, err := os.Stat(orphanTmp); !os.IsNotExist(err) {
+		t.Fatalf("orphan temp should be removed, stat err=%v", err)
+	}
+}
+
+func TestTimelineRefsCursorOrder(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		messages.TableName("alice"): {
+			{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "alice one"},
+			{LocalID: 3, SortSeq: 3001, CreateTime: 300, Status: 4, Content: "alice three"},
+		},
+		messages.TableName("bob"): {
+			{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "bob two"},
+		},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice", "bob"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	chats := []messages.ChatInfo{{Username: "alice"}, {Username: "bob"}}
+	refs, err := TimelineRefs(ctx, indexPath, TimelineQuery{Chats: chats, Start: 0, End: 1000, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := messages.NewService([]string{db}).ListByRefs(ctx, refs, messages.RefQueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ChatUsername != "alice" || got[1].ChatUsername != "bob" {
+		t.Fatalf("first page = %+v, want alice then bob", got)
+	}
+	nextRefs, err := TimelineRefs(ctx, indexPath, TimelineQuery{
+		Chats:    chats,
+		Start:    0,
+		End:      1000,
+		After:    timeline.KeyFor(got[1]),
+		HasAfter: true,
+		Limit:    2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := messages.NewService([]string{db}).ListByRefs(ctx, nextRefs, messages.RefQueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next) != 1 || next[0].Content != "alice three" {
+		t.Fatalf("next page = %+v, want alice three", next)
+	}
+}
+
+func TestCoversChatsDetectsMissingIndexedChat(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		messages.TableName("alice"): {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "alice one"}},
+		messages.TableName("bob"):   {{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "bob two"}},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	covered, err := CoversChats(ctx, indexPath, []messages.ChatInfo{{Username: "alice"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !covered {
+		t.Fatal("alice should be covered by the index")
+	}
+	covered, err = CoversChats(ctx, indexPath, []messages.ChatInfo{{Username: "alice"}, {Username: "bob"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if covered {
+		t.Fatal("index should not be treated as covering bob")
+	}
+}
+
+func TestSearchRefsFTSAndUnsupportedFallbackSignal(t *testing.T) {
+	requireSQLite3(t)
+	requireFTS5(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		messages.TableName("alice"): {
+			{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "AI project update"},
+			{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "ordinary note"},
+		},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs, total, err := SearchRefs(ctx, indexPath, SearchQuery{
+		Chats: []messages.ChatInfo{{Username: "alice"}},
+		Query: "AI",
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := messages.NewService([]string{db}).ListByRefs(ctx, refs, messages.RefQueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(got) != 1 || got[0].Content != "AI project update" {
+		t.Fatalf("search result total=%d items=%+v, want AI project update", total, got)
+	}
+	if _, _, err := SearchRefs(ctx, indexPath, SearchQuery{Query: "\x01", Limit: 10}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("unsupported query error = %v, want ErrUnavailable", err)
+	}
+}
+
+type indexMessageRow struct {
+	LocalID      int64
+	SortSeq      int64
+	CreateTime   int64
+	Status       int64
+	LocalType    int64
+	RealSenderID int64
+	SenderName   string
+	Content      string
+}
+
+func createIndexMessageDB(t *testing.T, path string, tables map[string][]indexMessageRow) {
+	t.Helper()
+	var sql strings.Builder
+	sql.WriteString("CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);\n")
+	sql.WriteString("INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (2, 'self_user', 0);\n")
+	for table, rows := range tables {
+		sql.WriteString(fmt.Sprintf(`
+CREATE TABLE [%s] (
+  local_id INTEGER PRIMARY KEY,
+  server_id INTEGER,
+  local_type INTEGER,
+  sort_seq INTEGER,
+  real_sender_id INTEGER,
+  create_time INTEGER,
+  status INTEGER,
+  message_content BLOB,
+  WCDB_CT_message_content INTEGER
+);
+`, table))
+		for _, row := range rows {
+			localType := row.LocalType
+			if localType == 0 {
+				localType = 1
+			}
+			if row.SenderName != "" && row.RealSenderID != 0 && row.RealSenderID != 2 {
+				sql.WriteString(fmt.Sprintf("INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (%d, %s, 0);\n", row.RealSenderID, sqlQuote(row.SenderName)))
+			}
+			sql.WriteString(fmt.Sprintf(
+				"INSERT INTO [%s] (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (%d, 0, %d, %d, %d, %d, %d, X'%s', 0);\n",
+				table,
+				row.LocalID,
+				localType,
+				row.SortSeq,
+				row.RealSenderID,
+				row.CreateTime,
+				row.Status,
+				hex.EncodeToString([]byte(row.Content)),
+			))
+		}
+	}
+	if out, err := exec.Command("sqlite3", path, sql.String()).CombinedOutput(); err != nil {
+		t.Fatalf("create message db: %v: %s", err, out)
+	}
+}
+
+func insertIndexMessageRow(t *testing.T, path string, table string, row indexMessageRow) {
+	t.Helper()
+	localType := row.LocalType
+	if localType == 0 {
+		localType = 1
+	}
+	sql := fmt.Sprintf(
+		"INSERT INTO [%s] (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (%d, 0, %d, %d, %d, %d, %d, X'%s', 0);",
+		table,
+		row.LocalID,
+		localType,
+		row.SortSeq,
+		row.RealSenderID,
+		row.CreateTime,
+		row.Status,
+		hex.EncodeToString([]byte(row.Content)),
+	)
+	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
+		t.Fatalf("insert message row: %v: %s", err, out)
+	}
+}
+
+func requireSQLite3(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 not available")
+	}
+}
+
+func requireFTS5(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fts.db")
+	if out, err := exec.Command("sqlite3", path, "CREATE VIRTUAL TABLE message_fts USING fts5(search_text);").CombinedOutput(); err != nil {
+		t.Skipf("sqlite3 FTS5 not available: %v: %s", err, out)
+	}
+}
+
+func sqlQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}

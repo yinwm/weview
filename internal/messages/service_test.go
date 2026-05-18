@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	zstdpkg "github.com/klauspost/compress/zstd"
@@ -225,6 +226,17 @@ func TestListAddsVideoPathAndParsesVideoMetadata(t *testing.T) {
 	}
 	if detail["path"] != videoPath || detail["thumbnail_path"] != thumbPath || detail["media_status"] != "resolved" || detail["thumbnail"] != "true" {
 		t.Fatalf("unexpected resolved video detail: %+v", detail)
+	}
+}
+
+func TestSearchTextOmitsRawXMLSecrets(t *testing.T) {
+	content := `<msg><videomsg aeskey="secret-aes-key" cdnvideourl="video-file-id" cdnthumburl="thumb-file-id" playlength="43" /></msg>`
+	got := SearchText("alice", 43, 4, 0, "", content)
+	if strings.Contains(got, "secret-aes-key") || strings.Contains(got, "aeskey") {
+		t.Fatalf("search text should not include raw XML AES keys: %q", got)
+	}
+	if !strings.Contains(got, "[视频]") || !strings.Contains(got, "video-file-id") {
+		t.Fatalf("search text should retain safe parsed detail: %q", got)
 	}
 }
 

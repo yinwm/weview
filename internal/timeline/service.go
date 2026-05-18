@@ -42,10 +42,10 @@ type Result struct {
 type cursorPayload struct {
 	Version   int     `json:"v"`
 	QueryHash string  `json:"query_hash"`
-	After     sortKey `json:"after"`
+	After     SortKey `json:"after"`
 }
 
-type sortKey struct {
+type SortKey struct {
 	CreateTime   int64  `json:"create_time"`
 	Seq          int64  `json:"seq"`
 	ChatUsername string `json:"chat_username"`
@@ -66,19 +66,13 @@ func List(ctx context.Context, service messages.Service, opts QueryOptions) (Res
 	if opts.Limit <= 0 {
 		return Result{}, fmt.Errorf("limit must be > 0")
 	}
-	var after sortKey
+	var after SortKey
 	if strings.TrimSpace(opts.Cursor) != "" {
-		payload, err := decodeCursor(opts.Cursor)
+		afterKey, err := DecodeCursor(opts.Cursor, opts.QueryHash)
 		if err != nil {
 			return Result{}, err
 		}
-		if payload.Version != cursorVersion {
-			return Result{}, fmt.Errorf("invalid cursor version: restart timeline from the first page")
-		}
-		if payload.QueryHash != opts.QueryHash {
-			return Result{}, fmt.Errorf("cursor does not match query: restart timeline from the first page")
-		}
-		after = payload.After
+		after = afterKey
 	}
 
 	var all []messages.Message
@@ -114,7 +108,7 @@ func List(ctx context.Context, service messages.Service, opts QueryOptions) (Res
 		next, err := encodeCursor(cursorPayload{
 			Version:   cursorVersion,
 			QueryHash: opts.QueryHash,
-			After:     keyFor(result.Items[len(result.Items)-1]),
+			After:     KeyFor(result.Items[len(result.Items)-1]),
 		})
 		if err != nil {
 			return Result{}, err
@@ -144,10 +138,32 @@ func uniqueChats(chats []messages.ChatInfo) []messages.ChatInfo {
 	return out
 }
 
-func filterAfter(list []messages.Message, after sortKey) []messages.Message {
+func DecodeCursor(token string, queryHash string) (SortKey, error) {
+	payload, err := decodeCursor(token)
+	if err != nil {
+		return SortKey{}, err
+	}
+	if payload.Version != cursorVersion {
+		return SortKey{}, fmt.Errorf("invalid cursor version: restart timeline from the first page")
+	}
+	if payload.QueryHash != queryHash {
+		return SortKey{}, fmt.Errorf("cursor does not match query: restart timeline from the first page")
+	}
+	return payload.After, nil
+}
+
+func EncodeCursor(queryHash string, after SortKey) (string, error) {
+	return encodeCursor(cursorPayload{
+		Version:   cursorVersion,
+		QueryHash: queryHash,
+		After:     after,
+	})
+}
+
+func filterAfter(list []messages.Message, after SortKey) []messages.Message {
 	out := make([]messages.Message, 0, len(list))
 	for _, msg := range list {
-		if compareKey(keyFor(msg), after) > 0 {
+		if CompareKey(KeyFor(msg), after) > 0 {
 			out = append(out, msg)
 		}
 	}
@@ -156,12 +172,12 @@ func filterAfter(list []messages.Message, after sortKey) []messages.Message {
 
 func sortMessages(list []messages.Message) {
 	sort.SliceStable(list, func(i, j int) bool {
-		return compareKey(keyFor(list[i]), keyFor(list[j])) < 0
+		return CompareKey(KeyFor(list[i]), KeyFor(list[j])) < 0
 	})
 }
 
-func keyFor(msg messages.Message) sortKey {
-	return sortKey{
+func KeyFor(msg messages.Message) SortKey {
+	return SortKey{
 		CreateTime:   msg.CreateTime,
 		Seq:          msg.Seq,
 		ChatUsername: msg.ChatUsername,
@@ -170,7 +186,7 @@ func keyFor(msg messages.Message) sortKey {
 	}
 }
 
-func compareKey(left sortKey, right sortKey) int {
+func CompareKey(left SortKey, right SortKey) int {
 	if left.CreateTime != right.CreateTime {
 		if left.CreateTime < right.CreateTime {
 			return -1

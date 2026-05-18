@@ -5,6 +5,7 @@ const (
 	ActionRefreshContacts  = "refresh_contacts"
 	ActionRefreshSessions  = "refresh_sessions"
 	ActionRefreshMessages  = "refresh_messages"
+	ActionRefreshIndex     = "refresh_index"
 	ActionRefreshAvatars   = "refresh_avatars"
 	ActionRefreshFavorites = "refresh_favorites"
 	ActionRefreshSNS       = "refresh_sns"
@@ -18,4 +19,5 @@ type Request struct {
 type Response struct {
 	OK      bool   `json:"ok"`
 	Message string `json:"message,omitempty"`
+	Version string `json:"version,omitempty"`
 }

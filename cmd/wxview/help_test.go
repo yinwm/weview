@@ -346,6 +346,7 @@ func TestCacheHelpIsActionable(t *testing.T) {
 	for _, want := range []string{
 		"wxview cache - Inspect local decrypted cache status",
 		"wxview cache status",
+		"wxview cache clean-tmp",
 		"--group all|contacts|messages|media|sessions|avatars|favorites|sns",
 		"fresh",
 		"stale",
@@ -355,6 +356,26 @@ func TestCacheHelpIsActionable(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("cache help missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestIndexHelpExplainsRefreshResetAndLag(t *testing.T) {
+	var out bytes.Buffer
+	if err := run([]string{"index", "--help"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{
+		"wxview index - Inspect and maintain the derived message index",
+		"wxview index refresh",
+		"wxview index rebuild --reset",
+		"wxview index clean-tmp",
+		"ready and near-realtime",
+		"Lag up to 60 seconds",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("index help missing %q:\n%s", want, text)
 		}
 	}
 }

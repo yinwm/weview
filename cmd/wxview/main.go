@@ -20,12 +20,14 @@ import (
 
 	"wxview/internal/app"
 	"wxview/internal/articles"
+	"wxview/internal/buildinfo"
 	"wxview/internal/contacts"
 	"wxview/internal/daemon"
 	"wxview/internal/favorites"
 	"wxview/internal/key"
 	"wxview/internal/media"
 	"wxview/internal/messages"
+	"wxview/internal/msgindex"
 	"wxview/internal/sessions"
 	"wxview/internal/sns"
 	"wxview/internal/timeline"
@@ -54,6 +56,8 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return runDaemon(args[1:], stdout)
 	case "cache":
 		return runCache(args[1:], stdout)
+	case "index":
+		return runIndex(ctx, args[1:], stdout)
 	case "contact", "contacts":
 		return runContacts(ctx, args[1:], stdout)
 	case "members":
@@ -109,6 +113,7 @@ Commands:
                     and save them locally. Usually run once at the beginning.
   wxview daemon     Show daemon help.
   wxview cache      Inspect local decrypted cache freshness and key coverage.
+  wxview index      Inspect and maintain the derived message index.
   wxview contacts   List contacts from the decrypted contact cache.
   wxview members    List members and owner for an explicit chatroom username.
   wxview sessions   List recent chats from the decrypted session cache.
@@ -146,6 +151,8 @@ Common examples:
   wxview sns feed --date today --limit 20 --format json
   wxview sns notifications --include-read --limit 20 --format json
   wxview cache status --format table
+  wxview index status
+  wxview index refresh
   wxview daemon start
   wxview daemon status
 
@@ -178,6 +185,7 @@ Current scope:
   wxview favorites --help
   wxview articles --help
   wxview sns --help
+  wxview index --help
   wxview cache --help
   wxview daemon --help`)
 }
@@ -190,6 +198,8 @@ func commandHelp(command string, stdout io.Writer, stderr io.Writer) error {
 		daemonUsage(stdout)
 	case "cache":
 		cacheUsage(stdout)
+	case "index":
+		indexUsage(stdout)
 	case "contact", "contacts":
 		contactsUsage(stdout)
 	case "members":
@@ -277,6 +287,7 @@ const (
 	daemonForegroundEnv   = "WXVIEW_DAEMON_FOREGROUND"
 	daemonSupportedForms  = "`wxview daemon`, `wxview daemon start`, `wxview daemon stop`, `wxview daemon status`"
 	daemonStartWait       = 15 * time.Second
+	daemonStopTimeout     = 35 * time.Second
 	daemonStopWait        = 5 * time.Second
 	daemonStatusPollEvery = 100 * time.Millisecond
 )
@@ -319,6 +330,7 @@ Internal daemon actions:
   refresh_contacts
   refresh_sessions
   refresh_messages
+  refresh_index
   refresh_avatars
   refresh_favorites
   refresh_sns
@@ -337,10 +349,13 @@ func cacheUsage(w io.Writer) {
 Usage:
   wxview cache
   wxview cache status [--group GROUP] [--format table|json|jsonl|csv]
+  wxview cache clean-tmp [--format table|json]
   wxview cache --help
 
 Subcommands:
   status         Report source DB, decrypted cache, mtime metadata, and key status.
+  clean-tmp      Remove expired decrypted-cache *.tmp files. Index tmp files
+                 are handled by wxview index clean-tmp.
 
 No-argument behavior:
   wxview cache is intentionally the same as wxview cache --help.
@@ -384,7 +399,53 @@ Key status values:
 Examples:
   wxview cache status
   wxview cache status --group messages --format json
-  wxview cache status --group media --format csv`)
+  wxview cache status --group media --format csv
+  wxview cache clean-tmp`)
+}
+
+func indexUsage(w io.Writer) {
+	fmt.Fprintln(w, `wxview index - Inspect and maintain the derived message index
+
+Usage:
+  wxview index
+  wxview index status [--format table|json|jsonl|csv]
+  wxview index refresh [--format table|json]
+  wxview index rebuild --reset [--format table|json]
+  wxview index clean-tmp [--format table|json]
+  wxview index --help
+
+Subcommands:
+  status         Report whether ~/.wxview/cache/<account>/index/messages.db is
+                 missing, building, interrupted, ready, refreshing, stale, or
+                 schema_mismatch.
+  refresh        Default maintenance action. Refreshes message caches first,
+                 resumes interrupted builds, builds missing indexes, and appends
+                 new rows to a ready index.
+  rebuild        Requires --reset. Deletes the current index/job/tmp files, then
+                 rebuilds from zero.
+  clean-tmp      Remove orphaned index tmp files from the index directory.
+
+Notes:
+  The index is a derived cache. It can be deleted and rebuilt at any time.
+  It stores row references and decoded text for future search acceleration, but
+  does not store DB keys or CDN AES keys. It accelerates messages and timeline
+  when ready and near-realtime. Lag up to 60 seconds is treated as normal
+  near-realtime delay; larger lag falls back to the original scan path.
+  This does not replace wxview cache status, which observes decrypted cache
+  freshness and key coverage.
+
+Flags:
+  --format table   Human-readable table output.
+  --format json    JSON output.
+  --format jsonl   Status only: one JSON object.
+  --format csv     Status only: CSV with header row.
+
+Examples:
+  wxview index status
+  wxview index status --format json
+  wxview index refresh --format json
+  wxview index rebuild --reset
+  wxview index clean-tmp`)
 }
 
 func contactsUsage(w io.Writer) {
@@ -601,8 +662,9 @@ Flags:
   --limit N        Return at most N rows after global time sorting. 0 means no limit.
   --offset N       Skip N rows after global time sorting.
   --source         Include source DB/table/local row metadata for debugging.
-  --refresh        Decrypt message text shards and supported message-related
-                   DBs into the local cache before querying. Without --refresh,
+  --no-index       Force the old scan path even when a ready index exists.
+  --refresh        Decrypt message/message_*.db shards and supported
+                   message-related DBs into the local cache before querying. Without --refresh,
                    uses the existing complete cache when available; otherwise
                    refreshes in this process.
 
@@ -653,11 +715,13 @@ Examples:
   wxview messages --username wxid_xxx --source --refresh --format json
 
 Runtime behavior:
-  This command reads message rows from local decrypted message caches and merges
-  all message/message_*.db shards before applying pagination. Results are sorted
-  by create_time ascending, then seq, source local id, and source shard.
-  V1 does not use a message index for this command; broad ranges in large chats
-  can be slow. Prefer bounded time windows and --after-seq pagination.
+  This command reads message rows from local decrypted message caches. When the
+  derived message index is ready and near-realtime, it uses the index to select
+  page row refs and then reads full rows from the original decrypted caches. If
+  the index is missing, building, interrupted, too stale, or unusable, it falls
+  back to the old shard scan. Use --no-index to compare or debug the scan path.
+  Results remain sorted by create_time ascending, then seq, source local id,
+  and source shard.
   Image and video messages in the returned page are resolved to local files
   automatically. WeChat .dat images and recognizable .dat videos are decoded
   or normalized into ~/.wxview/cache/<account>/media/.
@@ -742,6 +806,7 @@ Other flags:
   --format jsonl   Newline-delimited JSON, one message item per line.
   --format csv     CSV message items with header row.
   --source         Include source DB/table/local row metadata for debugging.
+  --no-index       Force the old scan path even when a ready index exists.
   --refresh        Refresh contact and message caches before querying.
 
 Examples:
@@ -751,13 +816,14 @@ Examples:
   wxview timeline --username wxid_xxx --date yesterday --format jsonl
 
 Runtime behavior:
-  This command selects conversations from the local contact cache, reads
-  matching message rows from local decrypted message caches, merges them into a
-  single create_time ascending timeline, and applies cursor pagination globally.
-  V1 does not maintain a message index. Wide ranges or broad selectors can be
-  very slow because the command fans out across conversations and message
-  shards before applying the global limit. Prefer small time windows and narrow
-  selectors such as --kind chatroom --query AI.
+  This command selects conversations from the local contact cache. When the
+  derived message index is ready, near-realtime, and covers every selected
+  conversation, it uses the index to select global timeline row refs and then
+  reads full rows from the original decrypted caches. If the index is missing,
+  building, interrupted, too stale, incomplete, or unusable, it falls back to the
+  old fan-out scan.
+  Prefer small time windows and narrow selectors such as --kind chatroom
+  --query AI.
   JSON output includes meta.schema_version and meta.timezone. It also includes
   meta.next_args so AI/tool callers can continue paging without understanding
   the cursor internals.`)
@@ -970,7 +1036,7 @@ func runDaemonForeground(stdout io.Writer) error {
 	defer stop()
 
 	fmt.Fprintf(stdout, "daemon socket: %s\n", socketPath)
-	fmt.Fprintln(stdout, "initializing local caches...")
+	fmt.Fprintln(stdout, "starting cache maintenance...")
 	server := &daemon.Server{SocketPath: socketPath, Shutdown: stop}
 	if err := server.Run(ctx); err != nil {
 		return err
@@ -1054,7 +1120,7 @@ func runDaemonStop(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	client := daemon.Client{SocketPath: socketPath, Timeout: 500 * time.Millisecond}
+	client := daemon.Client{SocketPath: socketPath, Timeout: daemonStopTimeout}
 	fmt.Fprintf(stdout, "daemon socket: %s\n", socketPath)
 	if !client.Healthy(context.Background()) {
 		fmt.Fprintln(stdout, "status: stopped")
@@ -1086,7 +1152,13 @@ func runDaemonStatus(args []string, stdout io.Writer) error {
 	}
 	client := daemon.Client{SocketPath: socketPath, Timeout: 500 * time.Millisecond}
 	fmt.Fprintf(stdout, "daemon socket: %s\n", socketPath)
-	if client.Healthy(context.Background()) {
+	fmt.Fprintf(stdout, "version: %s\n", buildinfo.String())
+	if resp, err := client.Call(context.Background(), daemon.ActionHealth); err == nil && resp.OK {
+		if strings.TrimSpace(resp.Version) == "" {
+			fmt.Fprintln(stdout, "daemon_version: unknown")
+		} else if resp.Version != buildinfo.String() {
+			fmt.Fprintf(stdout, "daemon_version: %s\n", resp.Version)
+		}
 		fmt.Fprintln(stdout, "status: running")
 		return nil
 	}
@@ -1102,8 +1174,10 @@ func runCache(args []string, stdout io.Writer) error {
 	switch args[0] {
 	case "status":
 		return runCacheStatus(args[1:], stdout)
+	case "clean-tmp":
+		return runCacheCleanTmp(args[1:], stdout)
 	default:
-		return fmt.Errorf("unknown cache command: %s; supported form is `wxview cache status`", args[0])
+		return fmt.Errorf("unknown cache command: %s; supported forms are `wxview cache status` and `wxview cache clean-tmp`", args[0])
 	}
 }
 
@@ -1133,6 +1207,169 @@ func runCacheStatus(args []string, stdout io.Writer) error {
 		return err
 	}
 	return writeCacheStatuses(stdout, items, *format)
+}
+
+func runCacheCleanTmp(args []string, stdout io.Writer) error {
+	if hasHelp(args) {
+		cacheUsage(stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("cache clean-tmp", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	format := fs.String("format", "table", "table or json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected cache clean-tmp argument: %s", fs.Arg(0))
+	}
+	if *format != "table" && *format != "json" {
+		return fmt.Errorf("invalid format %q: use table or json", *format)
+	}
+	result, err := key.CleanTmp()
+	if err != nil {
+		return err
+	}
+	return writeCleanTmpResult(stdout, result.Path, result.Removed, result.RemovedBytes, result.Kept, *format)
+}
+
+func runIndex(ctx context.Context, args []string, stdout io.Writer) error {
+	if len(args) == 0 || hasHelp(args) {
+		indexUsage(stdout)
+		return nil
+	}
+	switch args[0] {
+	case "status":
+		return runIndexStatus(ctx, args[1:], stdout)
+	case "refresh":
+		return runIndexRefresh(ctx, args[1:], stdout)
+	case "rebuild":
+		return runIndexRebuild(ctx, args[1:], stdout)
+	case "clean-tmp":
+		return runIndexCleanTmp(ctx, args[1:], stdout)
+	default:
+		return fmt.Errorf("unknown index command: %s; supported forms are `wxview index status`, `wxview index refresh`, `wxview index rebuild --reset`, and `wxview index clean-tmp`", args[0])
+	}
+}
+
+func runIndexStatus(ctx context.Context, args []string, stdout io.Writer) error {
+	if hasHelp(args) {
+		indexUsage(stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("index status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	format := fs.String("format", "table", "table, json, jsonl, or csv")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected index status argument: %s", fs.Arg(0))
+	}
+	if !validFormat(*format) {
+		return fmt.Errorf("invalid format %q: use table, json, jsonl, or csv", *format)
+	}
+	target, err := key.DiscoverContactDB()
+	if err != nil {
+		return err
+	}
+	indexPath, err := msgindex.LocalPath(target.Account)
+	if err != nil {
+		return err
+	}
+	cachePaths, err := messageCachePathsReadOnly(target.Account)
+	if err != nil {
+		return err
+	}
+	status, err := msgindex.DetailedStatusFor(ctx, indexPath, cachePaths)
+	if err != nil {
+		return err
+	}
+	return writeIndexStatus(stdout, status, *format)
+}
+
+func runIndexRefresh(ctx context.Context, args []string, stdout io.Writer) error {
+	if hasHelp(args) {
+		indexUsage(stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("index refresh", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	format := fs.String("format", "table", "table or json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected index refresh argument: %s", fs.Arg(0))
+	}
+	if *format != "table" && *format != "json" {
+		return fmt.Errorf("invalid format %q: use table or json", *format)
+	}
+	result, err := buildMessageIndex(ctx, true, false)
+	if err != nil {
+		return err
+	}
+	return writeIndexBuildResult(stdout, result, *format)
+}
+
+func runIndexRebuild(ctx context.Context, args []string, stdout io.Writer) error {
+	if hasHelp(args) {
+		indexUsage(stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("index rebuild", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	format := fs.String("format", "table", "table or json")
+	reset := fs.Bool("reset", false, "delete the current index and rebuild from zero")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected index rebuild argument: %s", fs.Arg(0))
+	}
+	if !*reset {
+		return fmt.Errorf("wxview index rebuild requires --reset")
+	}
+	if *format != "table" && *format != "json" {
+		return fmt.Errorf("invalid format %q: use table or json", *format)
+	}
+	result, err := buildMessageIndex(ctx, true, true)
+	if err != nil {
+		return err
+	}
+	return writeIndexBuildResult(stdout, result, *format)
+}
+
+func runIndexCleanTmp(ctx context.Context, args []string, stdout io.Writer) error {
+	if hasHelp(args) {
+		indexUsage(stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("index clean-tmp", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	format := fs.String("format", "table", "table or json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected index clean-tmp argument: %s", fs.Arg(0))
+	}
+	if *format != "table" && *format != "json" {
+		return fmt.Errorf("invalid format %q: use table or json", *format)
+	}
+	target, err := key.DiscoverContactDB()
+	if err != nil {
+		return err
+	}
+	indexPath, err := msgindex.LocalPath(target.Account)
+	if err != nil {
+		return err
+	}
+	result, err := msgindex.CleanIndexTmpResult(indexPath)
+	if err != nil {
+		return err
+	}
+	return writeCleanTmpResult(stdout, result.Path, result.Removed, result.RemovedBytes, result.Kept, *format)
 }
 
 func waitForDaemonHealthy(ctx context.Context, client daemon.Client, timeout time.Duration, exitCh <-chan error) (bool, error) {
@@ -1528,6 +1765,7 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 	limit := fs.Int("limit", 0, "maximum rows to return after sorting; 0 means no limit")
 	offset := fs.Int("offset", 0, "rows to skip after sorting")
 	includeSource := fs.Bool("source", false, "include source DB/table/local row metadata")
+	noIndex := fs.Bool("no-index", false, "force old message-cache scan path")
 	refresh := fs.Bool("refresh", false, "refresh decrypted message caches before listing")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1573,7 +1811,8 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	resolver := newMediaResolver(target, cacheDir)
-	list, err := messages.NewService(cachePaths).List(ctx, messages.QueryOptions{
+	service := messages.NewService(cachePaths)
+	list, err := listMessagesMaybeIndex(ctx, target.Account, cachePaths, service, !*noIndex, messages.QueryOptions{
 		Username:      usernameValue,
 		Start:         start,
 		End:           end,
@@ -1605,7 +1844,7 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 		}
 		if hasMore && len(page) > 0 {
 			meta.NextAfterSeq = page[len(page)-1].Seq
-			meta.NextArgs = buildMessagesNextArgs(usernameValue, start, hasStart, end, hasEnd, meta.NextAfterSeq, *limit, *includeSource)
+			meta.NextArgs = buildMessagesNextArgs(usernameValue, start, hasStart, end, hasEnd, meta.NextAfterSeq, *limit, *includeSource, *noIndex)
 		}
 		return writeMessageEnvelope(stdout, meta, page)
 	}
@@ -1664,6 +1903,10 @@ func runSearch(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	service := messages.NewService(cachePaths)
+	target, err := key.DiscoverContactDB()
+	if err != nil {
+		return err
+	}
 	list, total, err := service.Search(ctx, messages.SearchOptions{
 		Chats:         chats,
 		Query:         strings.TrimSpace(*query),
@@ -1679,10 +1922,6 @@ func runSearch(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	if len(list) > 0 {
-		target, err := key.DiscoverContactDB()
-		if err != nil {
-			return err
-		}
 		cacheDir, err := media.MediaCacheDir(target.Account)
 		if err != nil {
 			return err
@@ -1729,6 +1968,7 @@ func runTimeline(ctx context.Context, args []string, stdout io.Writer) error {
 	limit := fs.Int("limit", 200, "maximum rows to return; max 1000")
 	cursor := fs.String("cursor", "", "opaque cursor from meta.next_cursor")
 	includeSource := fs.Bool("source", false, "include source DB/table/local row metadata")
+	noIndex := fs.Bool("no-index", false, "force old message-cache scan path")
 	refresh := fs.Bool("refresh", false, "refresh contact and message caches before listing")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1791,7 +2031,8 @@ func runTimeline(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	result, err := timeline.List(ctx, messages.NewService(cachePaths), timeline.QueryOptions{
+	service := messages.NewService(cachePaths)
+	result, err := timelineMaybeIndex(ctx, target.Account, cachePaths, service, !*noIndex, timeline.QueryOptions{
 		Chats:         chats,
 		Start:         start,
 		End:           end,
@@ -1826,7 +2067,7 @@ func runTimeline(ctx context.Context, args []string, stdout io.Writer) error {
 		}
 		if result.HasMore {
 			meta.NextCursor = result.NextCursor
-			meta.NextArgs = buildTimelineNextArgs(usernameValue, *kind, queryValue, startLabel, endLabel, *limit, result.NextCursor, *includeSource)
+			meta.NextArgs = buildTimelineNextArgs(usernameValue, *kind, queryValue, startLabel, endLabel, *limit, result.NextCursor, *includeSource, *noIndex)
 		}
 		return writeMessageEnvelope(stdout, meta, result.Items)
 	}
@@ -2110,6 +2351,107 @@ type messageEnvelope struct {
 	Items []messages.Message `json:"items"`
 }
 
+func listMessagesMaybeIndex(ctx context.Context, account string, cachePaths []string, service messages.Service, useIndex bool, opts messages.QueryOptions) ([]messages.Message, error) {
+	if useIndex {
+		if indexPath, ok := usableIndexPath(ctx, account, cachePaths, msgindex.UsabilityOptions{
+			Username: opts.Username,
+			Start:    opts.Start,
+			End:      opts.End,
+			HasStart: opts.HasStart,
+			HasEnd:   opts.HasEnd,
+		}); ok {
+			refs, err := msgindex.MessageRefs(ctx, indexPath, msgindex.MessageQuery{
+				Username:    opts.Username,
+				Start:       opts.Start,
+				End:         opts.End,
+				AfterSeq:    opts.AfterSeq,
+				HasStart:    opts.HasStart,
+				HasEnd:      opts.HasEnd,
+				HasAfterSeq: opts.HasAfterSeq,
+				Limit:       opts.Limit,
+				Offset:      opts.Offset,
+			})
+			if err == nil {
+				list, err := service.ListByRefs(ctx, refs, messages.RefQueryOptions{
+					IncludeSource: opts.IncludeSource,
+					MediaResolver: opts.MediaResolver,
+				})
+				if err == nil {
+					return list, nil
+				}
+			}
+		}
+	}
+	return service.List(ctx, opts)
+}
+
+func timelineMaybeIndex(ctx context.Context, account string, cachePaths []string, service messages.Service, useIndex bool, opts timeline.QueryOptions) (timeline.Result, error) {
+	if useIndex {
+		if indexPath, ok := usableIndexPath(ctx, account, cachePaths, msgindex.UsabilityOptions{
+			Chats:    opts.Chats,
+			Start:    opts.Start,
+			End:      opts.End,
+			HasStart: true,
+			HasEnd:   true,
+		}); ok {
+			var after timeline.SortKey
+			hasAfter := false
+			if strings.TrimSpace(opts.Cursor) != "" {
+				var err error
+				after, err = timeline.DecodeCursor(opts.Cursor, opts.QueryHash)
+				if err != nil {
+					return timeline.Result{}, err
+				}
+				hasAfter = true
+			}
+			refs, err := msgindex.TimelineRefs(ctx, indexPath, msgindex.TimelineQuery{
+				Chats:    opts.Chats,
+				Start:    opts.Start,
+				End:      opts.End,
+				After:    after,
+				HasAfter: hasAfter,
+				Limit:    opts.Limit + 1,
+			})
+			if err == nil {
+				items, err := service.ListByRefs(ctx, refs, messages.RefQueryOptions{IncludeSource: opts.IncludeSource})
+				if err == nil {
+					chatInfo := make(map[string]messages.ChatInfo, len(opts.Chats))
+					for _, chat := range opts.Chats {
+						chatInfo[chat.Username] = chat
+					}
+					messages.ApplyChatInfo(items, chatInfo)
+					result := timeline.Result{Items: items}
+					if len(result.Items) > opts.Limit {
+						result.HasMore = true
+						result.Items = result.Items[:opts.Limit]
+					}
+					if result.HasMore && len(result.Items) > 0 {
+						next, err := timeline.EncodeCursor(opts.QueryHash, timeline.KeyFor(result.Items[len(result.Items)-1]))
+						if err != nil {
+							return timeline.Result{}, err
+						}
+						result.NextCursor = next
+					}
+					return result, nil
+				}
+			}
+		}
+	}
+	return timeline.List(ctx, service, opts)
+}
+
+func usableIndexPath(ctx context.Context, account string, cachePaths []string, opts msgindex.UsabilityOptions) (string, bool) {
+	indexPath, err := msgindex.LocalPath(account)
+	if err != nil {
+		return "", false
+	}
+	usability, err := msgindex.UseForQuery(ctx, indexPath, cachePaths, opts)
+	if err != nil || !usability.UseIndex {
+		return "", false
+	}
+	return indexPath, true
+}
+
 func selectSearchChats(ctx context.Context, username string, kind string, query string, refresh bool) ([]messages.ChatInfo, int, error) {
 	if username != "" {
 		if refresh {
@@ -2324,6 +2666,84 @@ func refreshMessageCaches(ctx context.Context) error {
 	}
 	_, err = key.EnsureMessageRelatedCaches(ctx)
 	return err
+}
+
+func buildMessageIndex(ctx context.Context, refreshCaches bool, reset bool) (msgindex.BuildResult, error) {
+	if refreshCaches {
+		socketPath, err := app.SocketPath()
+		if err != nil {
+			return msgindex.BuildResult{}, err
+		}
+		client := daemon.Client{SocketPath: socketPath, Timeout: 10 * time.Minute}
+		if client.Healthy(ctx) && !reset {
+			if _, err := client.Call(ctx, daemon.ActionRefreshIndex); err != nil {
+				if !isUnknownDaemonAction(err) {
+					return msgindex.BuildResult{}, err
+				}
+			} else {
+				target, err := key.DiscoverContactDB()
+				if err != nil {
+					return msgindex.BuildResult{}, err
+				}
+				indexPath, err := msgindex.LocalPath(target.Account)
+				if err != nil {
+					return msgindex.BuildResult{}, err
+				}
+				cachePaths, err := messageCachePathsReadOnly(target.Account)
+				if err != nil {
+					return msgindex.BuildResult{}, err
+				}
+				status, err := msgindex.StatusFor(ctx, indexPath, cachePaths)
+				if err != nil {
+					return msgindex.BuildResult{}, err
+				}
+				return msgindex.BuildResult{Status: status}, nil
+			}
+		}
+		if err := refreshMessageCaches(ctx); err != nil {
+			return msgindex.BuildResult{}, err
+		}
+	}
+	target, contactPath, ok := key.HasContactCache()
+	if !ok {
+		return msgindex.BuildResult{}, fmt.Errorf("contact cache does not exist: run `wxview init` or `wxview contacts --refresh --format json` first")
+	}
+	paths, allExist, err := key.MessageCachePaths()
+	if err != nil {
+		return msgindex.BuildResult{}, err
+	}
+	if !allExist {
+		return msgindex.BuildResult{}, fmt.Errorf("message cache does not exist: run `wxview init` or `wxview messages --refresh --username USERNAME` first")
+	}
+	opts := msgindex.BuildOptions{
+		Account:           target.Account,
+		ContactCachePath:  contactPath,
+		MessageCachePaths: paths,
+	}
+	if reset {
+		return msgindex.Build(ctx, opts)
+	}
+	return msgindex.Refresh(ctx, opts)
+}
+
+func messageCachePathsReadOnly(account string) ([]string, error) {
+	targets, err := key.DiscoverMessageDBs()
+	if err != nil {
+		return nil, err
+	}
+	base, err := app.BaseDir()
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(targets))
+	for _, target := range targets {
+		targetAccount := target.Account
+		if targetAccount == "" {
+			targetAccount = account
+		}
+		paths = append(paths, filepath.Join(base, "cache", app.SafeAccountDir(targetAccount), filepath.FromSlash(target.DBRelPath)))
+	}
+	return paths, nil
 }
 
 func articleCachePaths(ctx context.Context, refresh bool) ([]string, error) {
@@ -2658,7 +3078,7 @@ func localTimezoneName() string {
 	return fmt.Sprintf("UTC%s%02d:%02d", sign, offset/3600, (offset%3600)/60)
 }
 
-func buildMessagesNextArgs(username string, start int64, hasStart bool, end int64, hasEnd bool, nextAfterSeq int64, limit int, includeSource bool) []string {
+func buildMessagesNextArgs(username string, start int64, hasStart bool, end int64, hasEnd bool, nextAfterSeq int64, limit int, includeSource bool, noIndex bool) []string {
 	args := []string{"messages", "--username", username}
 	if hasStart {
 		args = append(args, "--start", formatMetaTime(start, true))
@@ -2673,11 +3093,14 @@ func buildMessagesNextArgs(username string, start int64, hasStart bool, end int6
 	if includeSource {
 		args = append(args, "--source")
 	}
+	if noIndex {
+		args = append(args, "--no-index")
+	}
 	args = append(args, "--format", "json")
 	return args
 }
 
-func buildTimelineNextArgs(username string, kind string, query string, start string, end string, limit int, cursor string, includeSource bool) []string {
+func buildTimelineNextArgs(username string, kind string, query string, start string, end string, limit int, cursor string, includeSource bool, noIndex bool) []string {
 	args := []string{"timeline"}
 	if username != "" {
 		args = append(args, "--username", username)
@@ -2690,6 +3113,9 @@ func buildTimelineNextArgs(username string, kind string, query string, start str
 	args = append(args, "--start", start, "--end", end, "--limit", strconv.Itoa(limit), "--cursor", cursor)
 	if includeSource {
 		args = append(args, "--source")
+	}
+	if noIndex {
+		args = append(args, "--no-index")
 	}
 	args = append(args, "--format", "json")
 	return args
@@ -2769,6 +3195,9 @@ var articleFields = []string{"id", "account_username", "account_display_name", "
 var snsPostFields = []string{"id", "author_username", "time", "timestamp", "content", "location", "media_count"}
 var snsNotificationFields = []string{"id", "type", "from_username", "from_nick_name", "content", "feed_id", "feed_author_username", "feed_preview", "time", "timestamp"}
 var cacheStatusFields = []string{"group", "account", "db_rel_path", "status", "key_status", "source_size", "cache_size", "source_mtime", "cache_mtime", "refreshed_at", "reason"}
+var indexStatusFields = []string{"status", "query_mode", "schema_version", "source_db_count", "indexed_rows", "source_rows", "covered_chats", "built_at", "refreshed_at", "job_state", "lag_seconds", "lag_policy", "reason", "path", "progress_percent", "progress_rows", "progress_total_rows", "progress_tables", "progress_total_tables", "progress_current", "progress_updated_at"}
+var indexBuildFields = append(append([]string{}, indexStatusFields...), "duration_ms")
+var cleanTmpFields = []string{"path", "removed", "removed_bytes", "kept"}
 
 func writeContacts(w io.Writer, list []contacts.Contact, format string) error {
 	switch format {
@@ -3032,6 +3461,55 @@ func writeCacheStatuses(w io.Writer, list []key.CacheStatusItem, format string) 
 		return writeRows(w, cacheStatusFields, len(list), func(i int) []string { return cacheStatusValues(list[i]) })
 	case "table":
 		return writeTable(w, cacheStatusFields, len(list), func(i int) []string { return cacheStatusValues(list[i]) })
+	default:
+		return fmt.Errorf("unsupported format: %s", format)
+	}
+}
+
+func writeIndexStatus(w io.Writer, status msgindex.Status, format string) error {
+	switch format {
+	case "json":
+		enc := jsonEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(status)
+	case "jsonl":
+		return jsonEncoder(w).Encode(status)
+	case "csv":
+		return writeRows(w, indexStatusFields, 1, func(i int) []string { return indexStatusValues(status) })
+	case "table":
+		return writeKeyValues(w, indexStatusFields, indexStatusValues(status))
+	default:
+		return fmt.Errorf("unsupported format: %s", format)
+	}
+}
+
+func writeIndexBuildResult(w io.Writer, result msgindex.BuildResult, format string) error {
+	switch format {
+	case "json":
+		enc := jsonEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(result)
+	case "table":
+		return writeKeyValues(w, indexBuildFields, indexBuildValues(result))
+	default:
+		return fmt.Errorf("unsupported format: %s", format)
+	}
+}
+
+func writeCleanTmpResult(w io.Writer, path string, removed int, removedBytes int64, kept int, format string) error {
+	values := []string{path, strconv.Itoa(removed), strconv.FormatInt(removedBytes, 10), strconv.Itoa(kept)}
+	switch format {
+	case "json":
+		enc := jsonEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"path":          path,
+			"removed":       removed,
+			"removed_bytes": removedBytes,
+			"kept":          kept,
+		})
+	case "table":
+		return writeKeyValues(w, cleanTmpFields, values)
 	default:
 		return fmt.Errorf("unsupported format: %s", format)
 	}
@@ -3304,6 +3782,38 @@ func cacheStatusValues(item key.CacheStatusItem) []string {
 		item.RefreshedAt,
 		item.Reason,
 	}
+}
+
+func indexStatusValues(status msgindex.Status) []string {
+	return []string{
+		status.Status,
+		status.QueryMode,
+		strconv.Itoa(status.SchemaVersion),
+		strconv.Itoa(status.SourceDBCount),
+		strconv.FormatInt(status.IndexedRows, 10),
+		strconv.FormatInt(status.SourceRows, 10),
+		strconv.Itoa(status.CoveredChats),
+		status.BuiltAt,
+		status.RefreshedAt,
+		status.JobState,
+		strconv.FormatInt(status.LagSeconds, 10),
+		status.LagPolicy,
+		status.Reason,
+		status.Path,
+		fmt.Sprintf("%.2f", status.ProgressPercent),
+		strconv.FormatInt(status.ProgressRows, 10),
+		strconv.FormatInt(status.ProgressTotalRows, 10),
+		strconv.Itoa(status.ProgressTables),
+		strconv.Itoa(status.ProgressTotalTables),
+		status.ProgressCurrent,
+		status.ProgressUpdatedAt,
+	}
+}
+
+func indexBuildValues(result msgindex.BuildResult) []string {
+	values := indexStatusValues(result.Status)
+	values = append(values, strconv.FormatInt(result.DurationMS, 10))
+	return values
 }
 
 func writeKeyValues(w io.Writer, fields []string, values []string) error {
