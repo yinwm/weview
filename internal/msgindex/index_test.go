@@ -214,6 +214,210 @@ func TestRefreshCatchesUpIncrementally(t *testing.T) {
 	}
 }
 
+func TestRefreshUsesSessionDeltaBeforeReconcile(t *testing.T) {
+	requireFTS5(t)
+	ctx := context.Background()
+	oldBudget := reconcileTableBudget
+	reconcileTableBudget = 0
+	defer func() { reconcileTableBudget = oldBudget }()
+
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	sessionDB := filepath.Join(dir, "session.db")
+	aliceTable := messages.TableName("alice")
+	bobTable := messages.TableName("bob")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		aliceTable: {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "alice first"}},
+		bobTable:   {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "bob first"}},
+	})
+	createIndexSessionDB(t, sessionDB, map[string]indexSessionRow{
+		"alice": {LastTimestamp: 100, UnreadCount: 0, Summary: "alice first"},
+		"bob":   {LastTimestamp: 100, UnreadCount: 0, Summary: "bob first"},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		SessionCachePath:  sessionDB,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice", "bob"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	insertIndexMessageRow(t, db, aliceTable, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "alice second"})
+	insertIndexMessageRow(t, db, bobTable, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "bob second"})
+	updateIndexSessionRow(t, sessionDB, "alice", indexSessionRow{LastTimestamp: 200, UnreadCount: 1, Summary: "alice second"})
+	if err := os.Chtimes(db, time.Now().Add(-2*time.Second), time.Now().Add(-2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Refresh(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		SessionCachePath:  sessionDB,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice", "bob"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status.RefreshMode != "session_delta" || result.Status.ActiveChatsRefreshed != 1 {
+		t.Fatalf("refresh status = %+v, want one hot refreshed chat", result.Status)
+	}
+	aliceRefs, err := MessageRefs(ctx, indexPath, MessageQuery{Username: "alice", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aliceRefs) != 2 {
+		t.Fatalf("alice refs = %+v, want two indexed rows", aliceRefs)
+	}
+	bobRefs, err := MessageRefs(ctx, indexPath, MessageQuery{Username: "bob", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bobRefs) != 1 {
+		t.Fatalf("bob refs = %+v, want unchanged chat not reconciled in hot path", bobRefs)
+	}
+	indexDB, err := sqlitedb.OpenReadOnlyLive(ctx, indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, err := indexSourcesDB(ctx, indexDB)
+	closeErr := indexDB.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	current, err := statSource(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || sources[0].CacheMTimeNS == current.MTimeNS {
+		t.Fatalf("source metadata should stay pending until reconcile: sources=%+v current=%+v", sources, current)
+	}
+}
+
+func TestUseForQueryUsesChatLevelSessionFreshness(t *testing.T) {
+	requireFTS5(t)
+	ctx := context.Background()
+	oldBudget := reconcileTableBudget
+	reconcileTableBudget = 0
+	defer func() { reconcileTableBudget = oldBudget }()
+
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	sessionDB := filepath.Join(dir, "session.db")
+	aliceTable := messages.TableName("alice")
+	bobTable := messages.TableName("bob")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		aliceTable: {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "alice first"}},
+		bobTable:   {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "bob first"}},
+	})
+	createIndexSessionDB(t, sessionDB, map[string]indexSessionRow{
+		"alice": {LastTimestamp: 100, Summary: "alice first"},
+		"bob":   {LastTimestamp: 100, Summary: "bob first"},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		SessionCachePath:  sessionDB,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice", "bob"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	insertIndexMessageRow(t, db, aliceTable, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "alice second"})
+	updateIndexSessionRow(t, sessionDB, "alice", indexSessionRow{LastTimestamp: 200, Summary: "alice second"})
+	if _, err := Refresh(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		SessionCachePath:  sessionDB,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice", "bob"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(db, old, old); err != nil {
+		t.Fatal(err)
+	}
+	usable, err := UseForQuery(ctx, indexPath, []string{db}, UsabilityOptions{Username: "alice", SessionCachePath: sessionDB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !usable.UseIndex {
+		t.Fatalf("alice should use index by chat-level session freshness: %+v", usable)
+	}
+
+	updateIndexSessionRow(t, sessionDB, "bob", indexSessionRow{LastTimestamp: 300, Summary: "bob newer"})
+	usable, err = UseForQuery(ctx, indexPath, []string{db}, UsabilityOptions{
+		Chats:            []messages.ChatInfo{{Username: "alice"}, {Username: "bob"}},
+		SessionCachePath: sessionDB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usable.UseIndex {
+		t.Fatalf("timeline should fall back when one selected chat is behind: %+v", usable)
+	}
+}
+
+func TestRefreshPlanSkipsUnchangedSourcesAndUsesWatermarkMap(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "message_0.db")
+	table := messages.TableName("alice")
+	createIndexMessageDB(t, db, map[string][]indexMessageRow{
+		table: {{LocalID: 1, SortSeq: 1001, CreateTime: 100, Status: 4, Content: "first"}},
+	})
+	indexPath := filepath.Join(dir, "index.db")
+	if _, err := Build(ctx, BuildOptions{
+		Account:           "wxid_test",
+		IndexPath:         indexPath,
+		MessageCachePaths: []string{db},
+		ChatUsernames:     []string{"alice"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	indexDB, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer indexDB.Close()
+	watermarks, err := indexedTableWatermarksDB(ctx, indexDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, err := indexSourcesDB(ctx, indexDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareRefreshPlan(ctx, []string{db}, map[string]string{table: "alice"}, watermarks, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 0 {
+		t.Fatalf("unchanged source refresh plan = %+v, want skipped", plan)
+	}
+
+	insertIndexMessageRow(t, db, table, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "second"})
+	changedTime := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(db, changedTime, changedTime); err != nil {
+		t.Fatal(err)
+	}
+	plan, err = prepareRefreshPlan(ctx, []string{db}, map[string]string{table: "alice"}, watermarks, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 1 || len(plan[0].Tables) != 1 || plan[0].Tables[0].AfterLocalID != 1 {
+		t.Fatalf("changed source refresh plan = %+v, want one table after watermark 1", plan)
+	}
+}
+
 func TestRefreshResumesInterruptedIndexFromWatermark(t *testing.T) {
 	requireFTS5(t)
 	ctx := context.Background()
@@ -227,7 +431,7 @@ func TestRefreshResumesInterruptedIndexFromWatermark(t *testing.T) {
 	if err := initializeIndexDB(ctx, indexPath, "wxid_test", StatusInterrupted); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := indexTableIncrementalTx(ctx, indexPath, db, "message_0.db", table, "alice", 0, nil); err != nil {
+	if _, err := indexTableIncrementalTxForTest(ctx, indexPath, db, "message_0.db", table, "alice", 0); err != nil {
 		t.Fatal(err)
 	}
 	insertIndexMessageRow(t, db, table, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "second"})
@@ -361,7 +565,7 @@ func TestStatusMergesProgressWithIndexStatsAndInterruptedJobState(t *testing.T) 
 	if err := initializeIndexDB(ctx, indexPath, "wxid_test", StatusBuilding); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := indexTableIncrementalTx(ctx, indexPath, db, "message_0.db", table, "alice", -1, nil); err != nil {
+	if _, err := indexTableIncrementalTxForTest(ctx, indexPath, db, "message_0.db", table, "alice", -1); err != nil {
 		t.Fatal(err)
 	}
 	progress := buildProgress{
@@ -580,6 +784,12 @@ type indexMessageRow struct {
 	Content      string
 }
 
+type indexSessionRow struct {
+	LastTimestamp int64
+	UnreadCount   int64
+	Summary       string
+}
+
 func createIndexMessageDB(t *testing.T, path string, tables map[string][]indexMessageRow) {
 	t.Helper()
 	db := sqlitetest.CreateDB(t, path, "CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);")
@@ -606,6 +816,42 @@ CREATE TABLE %s (
 			insertIndexMessageRowDB(t, db, table, row)
 		}
 	}
+}
+
+func createIndexSessionDB(t *testing.T, path string, rows map[string]indexSessionRow) {
+	t.Helper()
+	db := sqlitetest.CreateDB(t, path, `
+CREATE TABLE SessionTable(
+  username TEXT PRIMARY KEY,
+  unread_count INTEGER,
+  summary BLOB,
+  last_timestamp INTEGER,
+  last_msg_type INTEGER,
+  last_msg_sender TEXT,
+  last_sender_display_name TEXT
+);`)
+	defer db.Close()
+	for username, row := range rows {
+		sqlitetest.Exec(t, db, `
+INSERT INTO SessionTable(username, unread_count, summary, last_timestamp, last_msg_type, last_msg_sender, last_sender_display_name)
+VALUES (?, ?, ?, ?, 1, '', '');`, username, row.UnreadCount, []byte(row.Summary), row.LastTimestamp)
+	}
+}
+
+func updateIndexSessionRow(t *testing.T, path string, username string, row indexSessionRow) {
+	t.Helper()
+	db, err := sqlitedb.OpenReadWrite(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	sqlitetest.Exec(t, db, `
+INSERT INTO SessionTable(username, unread_count, summary, last_timestamp, last_msg_type, last_msg_sender, last_sender_display_name)
+VALUES (?, ?, ?, ?, 1, '', '')
+ON CONFLICT(username) DO UPDATE SET
+  unread_count=excluded.unread_count,
+  summary=excluded.summary,
+  last_timestamp=excluded.last_timestamp;`, username, row.UnreadCount, []byte(row.Summary), row.LastTimestamp)
 }
 
 func insertIndexMessageRow(t *testing.T, path string, table string, row indexMessageRow) {
@@ -659,4 +905,18 @@ func execIndexTestSQL(t *testing.T, ctx context.Context, path string, query stri
 	}
 	defer db.Close()
 	sqlitetest.Exec(t, db, query, args...)
+}
+
+func indexTableIncrementalTxForTest(ctx context.Context, indexPath string, sourcePath string, sourceDBName string, table string, username string, afterLocalID int64) (int64, error) {
+	indexDB, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
+		return 0, err
+	}
+	defer indexDB.Close()
+	sourceDB, err := sqlitedb.OpenReadOnly(ctx, sourcePath)
+	if err != nil {
+		return 0, err
+	}
+	defer sourceDB.Close()
+	return indexTableIncrementalTx(ctx, indexDB, sourceDB, sourcePath, sourceDBName, table, username, afterLocalID, nil)
 }

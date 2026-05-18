@@ -1269,6 +1269,21 @@ func runIndexStatus(ctx context.Context, args []string, stdout io.Writer) error 
 	if !validFormat(*format) {
 		return fmt.Errorf("invalid format %q: use table, json, jsonl, or csv", *format)
 	}
+	localTarget, ok, err := localIndexStatusTarget()
+	if err != nil {
+		return err
+	}
+	if ok {
+		cachePaths, err := localMessageCachePathsReadOnly(localTarget.account)
+		if err != nil {
+			return err
+		}
+		status, err := msgindex.StatusFor(ctx, localTarget.indexPath, cachePaths)
+		if err != nil {
+			return err
+		}
+		return writeIndexStatus(stdout, status, *format)
+	}
 	target, err := key.DiscoverContactDB()
 	if err != nil {
 		return err
@@ -1281,11 +1296,86 @@ func runIndexStatus(ctx context.Context, args []string, stdout io.Writer) error 
 	if err != nil {
 		return err
 	}
-	status, err := msgindex.DetailedStatusFor(ctx, indexPath, cachePaths)
+	status, err := msgindex.StatusFor(ctx, indexPath, cachePaths)
 	if err != nil {
 		return err
 	}
 	return writeIndexStatus(stdout, status, *format)
+}
+
+type indexStatusTarget struct {
+	account   string
+	indexPath string
+	modTime   time.Time
+}
+
+func localIndexStatusTarget() (indexStatusTarget, bool, error) {
+	base, err := app.BaseDir()
+	if err != nil {
+		return indexStatusTarget{}, false, err
+	}
+	cacheRoot := filepath.Join(base, "cache")
+	if target, ok, err := localIndexStatusTargetFromGlob(filepath.Join(cacheRoot, "*", "index", "messages.db")); err != nil || ok {
+		return target, ok, err
+	}
+	contacts, err := filepath.Glob(filepath.Join(cacheRoot, "*", "contact", "contact.db"))
+	if err != nil {
+		return indexStatusTarget{}, false, err
+	}
+	targets := make([]indexStatusTarget, 0, len(contacts))
+	for _, contactPath := range contacts {
+		info, err := os.Stat(contactPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		accountDir := filepath.Dir(filepath.Dir(contactPath))
+		account := filepath.Base(accountDir)
+		targets = append(targets, indexStatusTarget{
+			account:   account,
+			indexPath: filepath.Join(accountDir, "index", "messages.db"),
+			modTime:   info.ModTime(),
+		})
+	}
+	if len(targets) == 0 {
+		return indexStatusTarget{}, false, nil
+	}
+	sort.SliceStable(targets, func(i, j int) bool {
+		if !targets[i].modTime.Equal(targets[j].modTime) {
+			return targets[i].modTime.After(targets[j].modTime)
+		}
+		return targets[i].account < targets[j].account
+	})
+	return targets[0], true, nil
+}
+
+func localIndexStatusTargetFromGlob(pattern string) (indexStatusTarget, bool, error) {
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return indexStatusTarget{}, false, err
+	}
+	targets := make([]indexStatusTarget, 0, len(matches))
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		accountDir := filepath.Dir(filepath.Dir(path))
+		targets = append(targets, indexStatusTarget{
+			account:   filepath.Base(accountDir),
+			indexPath: path,
+			modTime:   info.ModTime(),
+		})
+	}
+	if len(targets) == 0 {
+		return indexStatusTarget{}, false, nil
+	}
+	sort.SliceStable(targets, func(i, j int) bool {
+		if !targets[i].modTime.Equal(targets[j].modTime) {
+			return targets[i].modTime.After(targets[j].modTime)
+		}
+		return targets[i].account < targets[j].account
+	})
+	return targets[0], true, nil
 }
 
 func runIndexRefresh(ctx context.Context, args []string, stdout io.Writer) error {
@@ -1812,7 +1902,7 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	resolver := newMediaResolver(target, cacheDir)
 	service := messages.NewService(cachePaths)
-	list, err := listMessagesMaybeIndex(ctx, target.Account, cachePaths, service, !*noIndex, messages.QueryOptions{
+	list, execution, err := listMessagesMaybeIndex(ctx, target.Account, cachePaths, service, !*noIndex, messages.QueryOptions{
 		Username:      usernameValue,
 		Start:         start,
 		End:           end,
@@ -1832,15 +1922,16 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 	if *format == "json" {
 		page, hasMore := trimMessagePage(list, *limit)
 		meta := messagesMeta{
-			SchemaVersion: messageEnvelopeSchemaVersion,
-			Timezone:      localTimezoneName(),
-			Mode:          "messages",
-			Username:      usernameValue,
-			Start:         formatMetaTime(start, hasStart),
-			End:           formatMetaTime(end, hasEnd),
-			Limit:         *limit,
-			Returned:      len(page),
-			HasMore:       hasMore,
+			SchemaVersion:      messageEnvelopeSchemaVersion,
+			Timezone:           localTimezoneName(),
+			Mode:               "messages",
+			queryExecutionMeta: execution,
+			Username:           usernameValue,
+			Start:              formatMetaTime(start, hasStart),
+			End:                formatMetaTime(end, hasEnd),
+			Limit:              *limit,
+			Returned:           len(page),
+			HasMore:            hasMore,
 		}
 		if hasMore && len(page) > 0 {
 			meta.NextAfterSeq = page[len(page)-1].Seq
@@ -1931,20 +2022,21 @@ func runSearch(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	if *format == "json" {
 		meta := searchMeta{
-			SchemaVersion: messageEnvelopeSchemaVersion,
-			Timezone:      localTimezoneName(),
-			Mode:          "search",
-			Query:         strings.TrimSpace(*query),
-			Kind:          *kind,
-			ChatQuery:     chatQueryValue,
-			Username:      usernameValue,
-			Start:         formatMetaTime(start, hasStart),
-			End:           formatMetaTime(end, hasEnd),
-			Limit:         *limit,
-			Offset:        *offset,
-			Returned:      len(list),
-			TotalMatches:  total,
-			MatchedChats:  matchedChats,
+			SchemaVersion:      messageEnvelopeSchemaVersion,
+			Timezone:           localTimezoneName(),
+			Mode:               "search",
+			queryExecutionMeta: scanExecution("index_not_supported_for_search"),
+			Query:              strings.TrimSpace(*query),
+			Kind:               *kind,
+			ChatQuery:          chatQueryValue,
+			Username:           usernameValue,
+			Start:              formatMetaTime(start, hasStart),
+			End:                formatMetaTime(end, hasEnd),
+			Limit:              *limit,
+			Offset:             *offset,
+			Returned:           len(list),
+			TotalMatches:       total,
+			MatchedChats:       matchedChats,
 		}
 		return writeMessageEnvelope(stdout, meta, list)
 	}
@@ -2032,7 +2124,7 @@ func runTimeline(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	service := messages.NewService(cachePaths)
-	result, err := timelineMaybeIndex(ctx, target.Account, cachePaths, service, !*noIndex, timeline.QueryOptions{
+	result, execution, err := timelineMaybeIndex(ctx, target.Account, cachePaths, service, !*noIndex, timeline.QueryOptions{
 		Chats:         chats,
 		Start:         start,
 		End:           end,
@@ -2048,18 +2140,19 @@ func runTimeline(ctx context.Context, args []string, stdout io.Writer) error {
 	messages.EnrichMediaDetails(result.Items, &resolver)
 	if *format == "json" {
 		meta := timelineMeta{
-			SchemaVersion: messageEnvelopeSchemaVersion,
-			Timezone:      localTimezoneName(),
-			Mode:          "timeline",
-			Kind:          "",
-			Query:         "",
-			Username:      usernameValue,
-			Start:         startLabel,
-			End:           endLabel,
-			Limit:         *limit,
-			Returned:      len(result.Items),
-			MatchedChats:  matchedChats,
-			HasMore:       result.HasMore,
+			SchemaVersion:      messageEnvelopeSchemaVersion,
+			Timezone:           localTimezoneName(),
+			Mode:               "timeline",
+			queryExecutionMeta: execution,
+			Kind:               "",
+			Query:              "",
+			Username:           usernameValue,
+			Start:              startLabel,
+			End:                endLabel,
+			Limit:              *limit,
+			Returned:           len(result.Items),
+			MatchedChats:       matchedChats,
+			HasMore:            result.HasMore,
 		}
 		if usernameValue == "" {
 			meta.Kind = *kind
@@ -2287,51 +2380,62 @@ func runSNSNotifications(ctx context.Context, args []string, stdout io.Writer) e
 }
 
 type messagesMeta struct {
-	SchemaVersion int      `json:"schema_version"`
-	Timezone      string   `json:"timezone"`
-	Mode          string   `json:"mode"`
-	Username      string   `json:"username"`
-	Start         string   `json:"start"`
-	End           string   `json:"end"`
-	Limit         int      `json:"limit"`
-	Returned      int      `json:"returned"`
-	HasMore       bool     `json:"has_more"`
-	NextAfterSeq  int64    `json:"next_after_seq,omitempty"`
-	NextArgs      []string `json:"next_args,omitempty"`
+	SchemaVersion int    `json:"schema_version"`
+	Timezone      string `json:"timezone"`
+	Mode          string `json:"mode"`
+	queryExecutionMeta
+	Username     string   `json:"username"`
+	Start        string   `json:"start"`
+	End          string   `json:"end"`
+	Limit        int      `json:"limit"`
+	Returned     int      `json:"returned"`
+	HasMore      bool     `json:"has_more"`
+	NextAfterSeq int64    `json:"next_after_seq,omitempty"`
+	NextArgs     []string `json:"next_args,omitempty"`
 }
 
 type timelineMeta struct {
-	SchemaVersion int      `json:"schema_version"`
-	Timezone      string   `json:"timezone"`
-	Mode          string   `json:"mode"`
-	Kind          string   `json:"kind,omitempty"`
-	Query         string   `json:"query,omitempty"`
-	Username      string   `json:"username,omitempty"`
-	Start         string   `json:"start"`
-	End           string   `json:"end"`
-	Limit         int      `json:"limit"`
-	Returned      int      `json:"returned"`
-	MatchedChats  int      `json:"matched_chats"`
-	HasMore       bool     `json:"has_more"`
-	NextCursor    string   `json:"next_cursor,omitempty"`
-	NextArgs      []string `json:"next_args,omitempty"`
+	SchemaVersion int    `json:"schema_version"`
+	Timezone      string `json:"timezone"`
+	Mode          string `json:"mode"`
+	queryExecutionMeta
+	Kind         string   `json:"kind,omitempty"`
+	Query        string   `json:"query,omitempty"`
+	Username     string   `json:"username,omitempty"`
+	Start        string   `json:"start"`
+	End          string   `json:"end"`
+	Limit        int      `json:"limit"`
+	Returned     int      `json:"returned"`
+	MatchedChats int      `json:"matched_chats"`
+	HasMore      bool     `json:"has_more"`
+	NextCursor   string   `json:"next_cursor,omitempty"`
+	NextArgs     []string `json:"next_args,omitempty"`
 }
 
 type searchMeta struct {
 	SchemaVersion int    `json:"schema_version"`
 	Timezone      string `json:"timezone"`
 	Mode          string `json:"mode"`
-	Query         string `json:"query"`
-	Kind          string `json:"kind,omitempty"`
-	ChatQuery     string `json:"chat_query,omitempty"`
-	Username      string `json:"username,omitempty"`
-	Start         string `json:"start"`
-	End           string `json:"end"`
-	Limit         int    `json:"limit"`
-	Offset        int    `json:"offset"`
-	Returned      int    `json:"returned"`
-	TotalMatches  int    `json:"total_matches"`
-	MatchedChats  int    `json:"matched_chats"`
+	queryExecutionMeta
+	Query        string `json:"query"`
+	Kind         string `json:"kind,omitempty"`
+	ChatQuery    string `json:"chat_query,omitempty"`
+	Username     string `json:"username,omitempty"`
+	Start        string `json:"start"`
+	End          string `json:"end"`
+	Limit        int    `json:"limit"`
+	Offset       int    `json:"offset"`
+	Returned     int    `json:"returned"`
+	TotalMatches int    `json:"total_matches"`
+	MatchedChats int    `json:"matched_chats"`
+}
+
+type queryExecutionMeta struct {
+	QueryMode       string `json:"query_mode,omitempty"`
+	IndexUsed       bool   `json:"index_used"`
+	IndexStatus     string `json:"index_status,omitempty"`
+	IndexReason     string `json:"index_reason,omitempty"`
+	IndexLagSeconds int64  `json:"index_lag_seconds,omitempty"`
 }
 
 type newMessagesMeta struct {
@@ -2351,105 +2455,162 @@ type messageEnvelope struct {
 	Items []messages.Message `json:"items"`
 }
 
-func listMessagesMaybeIndex(ctx context.Context, account string, cachePaths []string, service messages.Service, useIndex bool, opts messages.QueryOptions) ([]messages.Message, error) {
-	if useIndex {
-		if indexPath, ok := usableIndexPath(ctx, account, cachePaths, msgindex.UsabilityOptions{
-			Username: opts.Username,
-			Start:    opts.Start,
-			End:      opts.End,
-			HasStart: opts.HasStart,
-			HasEnd:   opts.HasEnd,
-		}); ok {
-			refs, err := msgindex.MessageRefs(ctx, indexPath, msgindex.MessageQuery{
-				Username:    opts.Username,
-				Start:       opts.Start,
-				End:         opts.End,
-				AfterSeq:    opts.AfterSeq,
-				HasStart:    opts.HasStart,
-				HasEnd:      opts.HasEnd,
-				HasAfterSeq: opts.HasAfterSeq,
-				Limit:       opts.Limit,
-				Offset:      opts.Offset,
+func listMessagesMaybeIndex(ctx context.Context, account string, cachePaths []string, service messages.Service, useIndex bool, opts messages.QueryOptions) ([]messages.Message, queryExecutionMeta, error) {
+	if !useIndex {
+		list, err := service.List(ctx, opts)
+		return list, scanExecution("index_disabled_by_flag"), err
+	}
+	indexPath, usability, ok := queryIndexUsability(ctx, account, cachePaths, msgindex.UsabilityOptions{
+		Username: opts.Username,
+		Start:    opts.Start,
+		End:      opts.End,
+		HasStart: opts.HasStart,
+		HasEnd:   opts.HasEnd,
+	})
+	if ok {
+		refs, err := msgindex.MessageRefs(ctx, indexPath, msgindex.MessageQuery{
+			Username:    opts.Username,
+			Start:       opts.Start,
+			End:         opts.End,
+			AfterSeq:    opts.AfterSeq,
+			HasStart:    opts.HasStart,
+			HasEnd:      opts.HasEnd,
+			HasAfterSeq: opts.HasAfterSeq,
+			Limit:       opts.Limit,
+			Offset:      opts.Offset,
+		})
+		if err == nil {
+			list, err := service.ListByRefs(ctx, refs, messages.RefQueryOptions{
+				IncludeSource: opts.IncludeSource,
+				MediaResolver: opts.MediaResolver,
 			})
 			if err == nil {
-				list, err := service.ListByRefs(ctx, refs, messages.RefQueryOptions{
-					IncludeSource: opts.IncludeSource,
-					MediaResolver: opts.MediaResolver,
-				})
-				if err == nil {
-					return list, nil
-				}
+				return list, indexExecution(usability), nil
 			}
 		}
 	}
-	return service.List(ctx, opts)
+	list, err := service.List(ctx, opts)
+	return list, scanExecutionFromUsability(usability), err
 }
 
-func timelineMaybeIndex(ctx context.Context, account string, cachePaths []string, service messages.Service, useIndex bool, opts timeline.QueryOptions) (timeline.Result, error) {
-	if useIndex {
-		if indexPath, ok := usableIndexPath(ctx, account, cachePaths, msgindex.UsabilityOptions{
+func timelineMaybeIndex(ctx context.Context, account string, cachePaths []string, service messages.Service, useIndex bool, opts timeline.QueryOptions) (timeline.Result, queryExecutionMeta, error) {
+	if !useIndex {
+		result, err := timeline.List(ctx, service, opts)
+		return result, scanExecution("index_disabled_by_flag"), err
+	}
+	indexPath, usability, ok := queryIndexUsability(ctx, account, cachePaths, msgindex.UsabilityOptions{
+		Chats:    opts.Chats,
+		Start:    opts.Start,
+		End:      opts.End,
+		HasStart: true,
+		HasEnd:   true,
+	})
+	if ok {
+		var after timeline.SortKey
+		hasAfter := false
+		if strings.TrimSpace(opts.Cursor) != "" {
+			var err error
+			after, err = timeline.DecodeCursor(opts.Cursor, opts.QueryHash)
+			if err != nil {
+				return timeline.Result{}, scanExecutionFromUsability(usability), err
+			}
+			hasAfter = true
+		}
+		refs, err := msgindex.TimelineRefs(ctx, indexPath, msgindex.TimelineQuery{
 			Chats:    opts.Chats,
 			Start:    opts.Start,
 			End:      opts.End,
-			HasStart: true,
-			HasEnd:   true,
-		}); ok {
-			var after timeline.SortKey
-			hasAfter := false
-			if strings.TrimSpace(opts.Cursor) != "" {
-				var err error
-				after, err = timeline.DecodeCursor(opts.Cursor, opts.QueryHash)
-				if err != nil {
-					return timeline.Result{}, err
-				}
-				hasAfter = true
-			}
-			refs, err := msgindex.TimelineRefs(ctx, indexPath, msgindex.TimelineQuery{
-				Chats:    opts.Chats,
-				Start:    opts.Start,
-				End:      opts.End,
-				After:    after,
-				HasAfter: hasAfter,
-				Limit:    opts.Limit + 1,
-			})
+			After:    after,
+			HasAfter: hasAfter,
+			Limit:    opts.Limit + 1,
+		})
+		if err == nil {
+			items, err := service.ListByRefs(ctx, refs, messages.RefQueryOptions{IncludeSource: opts.IncludeSource})
 			if err == nil {
-				items, err := service.ListByRefs(ctx, refs, messages.RefQueryOptions{IncludeSource: opts.IncludeSource})
-				if err == nil {
-					chatInfo := make(map[string]messages.ChatInfo, len(opts.Chats))
-					for _, chat := range opts.Chats {
-						chatInfo[chat.Username] = chat
-					}
-					messages.ApplyChatInfo(items, chatInfo)
-					result := timeline.Result{Items: items}
-					if len(result.Items) > opts.Limit {
-						result.HasMore = true
-						result.Items = result.Items[:opts.Limit]
-					}
-					if result.HasMore && len(result.Items) > 0 {
-						next, err := timeline.EncodeCursor(opts.QueryHash, timeline.KeyFor(result.Items[len(result.Items)-1]))
-						if err != nil {
-							return timeline.Result{}, err
-						}
-						result.NextCursor = next
-					}
-					return result, nil
+				chatInfo := make(map[string]messages.ChatInfo, len(opts.Chats))
+				for _, chat := range opts.Chats {
+					chatInfo[chat.Username] = chat
 				}
+				messages.ApplyChatInfo(items, chatInfo)
+				result := timeline.Result{Items: items}
+				if len(result.Items) > opts.Limit {
+					result.HasMore = true
+					result.Items = result.Items[:opts.Limit]
+				}
+				if result.HasMore && len(result.Items) > 0 {
+					next, err := timeline.EncodeCursor(opts.QueryHash, timeline.KeyFor(result.Items[len(result.Items)-1]))
+					if err != nil {
+						return timeline.Result{}, scanExecutionFromUsability(usability), err
+					}
+					result.NextCursor = next
+				}
+				return result, indexExecution(usability), nil
 			}
 		}
 	}
-	return timeline.List(ctx, service, opts)
+	result, err := timeline.List(ctx, service, opts)
+	return result, scanExecutionFromUsability(usability), err
 }
 
 func usableIndexPath(ctx context.Context, account string, cachePaths []string, opts msgindex.UsabilityOptions) (string, bool) {
+	indexPath, _, ok := queryIndexUsability(ctx, account, cachePaths, opts)
+	return indexPath, ok
+}
+
+func queryIndexUsability(ctx context.Context, account string, cachePaths []string, opts msgindex.UsabilityOptions) (string, msgindex.Usability, bool) {
 	indexPath, err := msgindex.LocalPath(account)
 	if err != nil {
-		return "", false
+		return "", msgindex.Usability{Reason: "index_path_error"}, false
+	}
+	if strings.TrimSpace(opts.SessionCachePath) == "" {
+		if sessionPath, err := key.SessionCachePath(account); err == nil {
+			if _, statErr := os.Stat(sessionPath); statErr == nil {
+				opts.SessionCachePath = sessionPath
+			}
+		}
 	}
 	usability, err := msgindex.UseForQuery(ctx, indexPath, cachePaths, opts)
 	if err != nil || !usability.UseIndex {
-		return "", false
+		if err != nil && strings.TrimSpace(usability.Reason) == "" {
+			usability.Reason = "index_status_error"
+		}
+		return "", usability, false
 	}
-	return indexPath, true
+	return indexPath, usability, true
+}
+
+func indexExecution(usability msgindex.Usability) queryExecutionMeta {
+	return queryExecutionMeta{
+		QueryMode:       msgindex.QueryModeIndex,
+		IndexUsed:       true,
+		IndexStatus:     usability.Status.Status,
+		IndexReason:     firstNonEmptyString(usability.Reason, "index_usable"),
+		IndexLagSeconds: usability.Status.LagSeconds,
+	}
+}
+
+func scanExecution(reason string) queryExecutionMeta {
+	return queryExecutionMeta{
+		QueryMode:   msgindex.QueryModeScan,
+		IndexUsed:   false,
+		IndexReason: reason,
+	}
+}
+
+func scanExecutionFromUsability(usability msgindex.Usability) queryExecutionMeta {
+	meta := scanExecution(firstNonEmptyString(usability.Reason, "index_unusable"))
+	meta.IndexStatus = usability.Status.Status
+	meta.IndexLagSeconds = usability.Status.LagSeconds
+	return meta
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func selectSearchChats(ctx context.Context, username string, kind string, query string, refresh bool) ([]messages.ChatInfo, int, error) {
@@ -2715,9 +2876,14 @@ func buildMessageIndex(ctx context.Context, refreshCaches bool, reset bool) (msg
 	if !allExist {
 		return msgindex.BuildResult{}, fmt.Errorf("message cache does not exist: run `wxview init` or `wxview messages --refresh --username USERNAME` first")
 	}
+	sessionPath := ""
+	if _, path, err := sessionCacheTargetPath(ctx, refreshCaches); err == nil {
+		sessionPath = path
+	}
 	opts := msgindex.BuildOptions{
 		Account:           target.Account,
 		ContactCachePath:  contactPath,
+		SessionCachePath:  sessionPath,
 		MessageCachePaths: paths,
 	}
 	if reset {
@@ -2744,6 +2910,44 @@ func messageCachePathsReadOnly(account string) ([]string, error) {
 		paths = append(paths, filepath.Join(base, "cache", app.SafeAccountDir(targetAccount), filepath.FromSlash(target.DBRelPath)))
 	}
 	return paths, nil
+}
+
+func localMessageCachePathsReadOnly(account string) ([]string, error) {
+	base, err := app.BaseDir()
+	if err != nil {
+		return nil, err
+	}
+	pattern := filepath.Join(base, "cache", app.SafeAccountDir(account), "message", "message_*.db")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(matches))
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if _, ok := localMessageShardIndex(filepath.Base(path)); !ok {
+			continue
+		}
+		paths = append(paths, path)
+	}
+	sort.SliceStable(paths, func(i, j int) bool {
+		left, _ := localMessageShardIndex(filepath.Base(paths[i]))
+		right, _ := localMessageShardIndex(filepath.Base(paths[j]))
+		return left < right
+	})
+	return paths, nil
+}
+
+func localMessageShardIndex(name string) (int, bool) {
+	if !strings.HasPrefix(name, "message_") || !strings.HasSuffix(name, ".db") {
+		return 0, false
+	}
+	text := strings.TrimSuffix(strings.TrimPrefix(name, "message_"), ".db")
+	index, err := strconv.Atoi(text)
+	return index, err == nil
 }
 
 func articleCachePaths(ctx context.Context, refresh bool) ([]string, error) {
@@ -3195,7 +3399,7 @@ var articleFields = []string{"id", "account_username", "account_display_name", "
 var snsPostFields = []string{"id", "author_username", "time", "timestamp", "content", "location", "media_count"}
 var snsNotificationFields = []string{"id", "type", "from_username", "from_nick_name", "content", "feed_id", "feed_author_username", "feed_preview", "time", "timestamp"}
 var cacheStatusFields = []string{"group", "account", "db_rel_path", "status", "key_status", "source_size", "cache_size", "source_mtime", "cache_mtime", "refreshed_at", "reason"}
-var indexStatusFields = []string{"status", "query_mode", "schema_version", "source_db_count", "indexed_rows", "source_rows", "covered_chats", "built_at", "refreshed_at", "job_state", "lag_seconds", "lag_policy", "reason", "path", "progress_percent", "progress_rows", "progress_total_rows", "checked_tables", "covered_tables", "progress_total_tables", "progress_current", "progress_updated_at"}
+var indexStatusFields = []string{"status", "query_mode", "schema_version", "source_db_count", "indexed_rows", "source_rows", "covered_chats", "built_at", "refreshed_at", "job_state", "lag_seconds", "session_lag_seconds", "lag_policy", "reason", "refresh_mode", "active_chats_checked", "active_chats_refreshed", "reconcile_sources_pending", "reconcile_tables_checked", "path", "progress_percent", "progress_rows", "progress_total_rows", "checked_tables", "covered_tables", "progress_total_tables", "progress_current", "progress_updated_at"}
 var indexBuildFields = append(append([]string{}, indexStatusFields...), "duration_ms")
 var cleanTmpFields = []string{"path", "removed", "removed_bytes", "kept"}
 
@@ -3797,8 +4001,14 @@ func indexStatusValues(status msgindex.Status) []string {
 		status.RefreshedAt,
 		status.JobState,
 		strconv.FormatInt(status.LagSeconds, 10),
+		strconv.FormatInt(status.SessionLagSeconds, 10),
 		status.LagPolicy,
 		status.Reason,
+		status.RefreshMode,
+		strconv.Itoa(status.ActiveChatsChecked),
+		strconv.Itoa(status.ActiveChatsRefreshed),
+		strconv.Itoa(status.ReconcileSourcesPending),
+		strconv.Itoa(status.ReconcileTablesChecked),
 		status.Path,
 		fmt.Sprintf("%.2f", status.ProgressPercent),
 		strconv.FormatInt(status.ProgressRows, 10),

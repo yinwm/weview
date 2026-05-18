@@ -115,10 +115,10 @@ func (s *Server) refresh(ctx context.Context) error {
 	if err := s.refreshMessages(ctx); err != nil {
 		return err
 	}
-	s.refreshIndexBackground(ctx, "startup message cache refresh")
 	if err := s.refreshSessions(ctx); err != nil {
 		log.Printf("refresh session cache skipped: %v", err)
 	}
+	s.refreshIndexBackground(ctx, "startup message cache refresh")
 	if err := s.refreshHeadImage(ctx); err != nil {
 		log.Printf("refresh head_image cache skipped: %v", err)
 	}
@@ -158,9 +158,16 @@ func (s *Server) refreshIndex(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	sessionPath := ""
+	if _, path, err := key.EnsureSessionCache(ctx); err != nil {
+		log.Printf("refresh session cache skipped before index refresh: %v", err)
+	} else {
+		sessionPath = path
+	}
 	_, err = msgindex.Refresh(ctx, msgindex.BuildOptions{
 		Account:           res.Target.Account,
 		ContactCachePath:  contactCache,
+		SessionCachePath:  sessionPath,
 		MessageCachePaths: messagePaths,
 	})
 	return err

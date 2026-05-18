@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -209,6 +211,59 @@ func TestDaemonStatusPrintsVersionWhenStopped(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("daemon status missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestIndexStatusUsesLocalCacheWithoutWechatDiscovery(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	accountDir := filepath.Join(home, ".wxview", "cache", "wxid_local", "contact")
+	if err := os.MkdirAll(accountDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(accountDir, "contact.db"), []byte("placeholder"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"index", "status"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "status: missing") {
+		t.Fatalf("index status should use local cache and report missing index:\n%s", text)
+	}
+	if !strings.Contains(text, filepath.Join(home, ".wxview", "cache", "wxid_local", "index", "messages.db")) {
+		t.Fatalf("index status used unexpected path:\n%s", text)
+	}
+}
+
+func TestLocalMessageCachePathsReadOnlySortsNumericShards(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	messageDir := filepath.Join(home, ".wxview", "cache", "wxid_local", "message")
+	if err := os.MkdirAll(messageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"message_10.db", "message_2.db", "message_0.db", "message_fts.db", "biz_message_1.db"} {
+		if err := os.WriteFile(filepath.Join(messageDir, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	paths, err := localMessageCachePathsReadOnly("wxid_local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(paths))
+	for _, path := range paths {
+		got = append(got, filepath.Base(path))
+	}
+	want := []string{"message_0.db", "message_2.db", "message_10.db"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("message cache paths = %#v, want %#v", got, want)
 	}
 }
 

@@ -62,8 +62,11 @@ paths automatically when the supporting caches are available.
   an extra override flag for that case.
 - `wxview messages` returns records sorted by time ascending by default. Apply
   `--limit` and `--offset` after merging all matching message shards.
-- V1 does not maintain a message index. Large chats or broad time ranges can be
-  slow because message shards are merged before pagination.
+- V1 maintains a derived local message index when available. `messages` may use
+  it as a fast path when the index is ready, covers the chat, and is either
+  globally near-real-time or chat-level fresh according to `session/session.db`.
+  It must fall back to direct decrypted message-cache scanning when the index is
+  missing, building, incompatible, or stale for the requested chat.
 - `--start` and `--end` are inclusive. Date-only `--end` includes the full day.
 - `messages --date today|yesterday|YYYY-MM-DD` selects one local calendar day
   and is mutually exclusive with `--start`/`--end`.
@@ -77,10 +80,12 @@ paths automatically when the supporting caches are available.
   cross-conversation time range. It supports `--format table|json|jsonl|csv`,
   `--kind all|friend|chatroom|other`, `--query`, `--username`, `--date`,
   `--start`, `--end`, `--limit`, `--cursor`, `--source`, and `--refresh`.
-- V1 must not imply `timeline` is indexed. It fans out across selected
-  conversations and message shards, merges results in-process, then applies the
-  global limit. Broad selectors or wide date ranges can be very slow; prefer
-  narrow selectors and small time windows in examples and AI/tool usage.
+- `timeline` may use the derived message index only when it covers every
+  selected conversation and each selected chat is fresh enough. Otherwise it
+  fans out across selected conversations and message shards, merges results
+  in-process, then applies the global limit. Broad selectors or wide date ranges
+  can be very slow; prefer narrow selectors and small time windows in examples
+  and AI/tool usage.
 - `wxview timeline` must have an explicit time range: either `--date
   today|yesterday|YYYY-MM-DD` or both `--start` and `--end`. `--date` is
   mutually exclusive with `--start`/`--end`.
@@ -106,10 +111,10 @@ paths automatically when the supporting caches are available.
   keeps account-scoped state under `~/.wxview/cache/<account>/state/`.
 - Future performance work should be documented as optional TODOs unless the
   product direction explicitly changes. Likely directions are SQL pagination
-  pushdown for `messages`, `timeline --explain` / dry-run estimation, batched
-  timeline fan-out with stable cursor semantics, and an optional local message
-  index. A future FTS5 index should be treated mainly as a `search` accelerator;
-  `messages` and `timeline` need ordinary chat/time indexes to become fast.
+  pushdown for scan fallbacks, `timeline --explain` / dry-run estimation,
+  better reconcile scheduling, and batched timeline fan-out with stable cursor
+  semantics. FTS should remain mainly a `search` accelerator; `messages` and
+  `timeline` rely on ordinary chat/time index rows for correctness and speed.
 - Message `items` from `messages`, `timeline`, `search`, and `new-messages` must
   share the same schema.
   Include chat metadata fields `chat_kind`, `chat_display_name`, `chat_alias`,

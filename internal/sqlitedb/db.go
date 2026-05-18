@@ -33,6 +33,26 @@ func OpenReadOnly(ctx context.Context, path string) (*sql.DB, error) {
 	return db, nil
 }
 
+func OpenReadOnlyLive(ctx context.Context, path string) (*sql.DB, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("sqlite path is empty")
+	}
+	db, err := sql.Open("sqlite", FileURI(path, url.Values{"mode": {"ro"}}))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d;", BusyTimeoutMS)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
 func OpenReadWrite(ctx context.Context, path string) (*sql.DB, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("sqlite path is empty")
@@ -46,6 +66,10 @@ func OpenReadWrite(ctx context.Context, path string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d;", BusyTimeoutMS)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode=WAL;"); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
