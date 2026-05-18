@@ -1,16 +1,12 @@
 package msgindex
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/hex"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -21,7 +17,7 @@ import (
 	"wxview/internal/app"
 	"wxview/internal/contacts"
 	"wxview/internal/messages"
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 	"wxview/internal/timeline"
 )
 
@@ -52,8 +48,7 @@ const (
 	lockName          = "messages.lock"
 	oldProgressName   = "messages.progress.json"
 	unitSep           = "\x1f"
-	recordSep         = "\x1e"
-	sqliteBusyTimeout = 30000
+	sqliteBusyTimeout = sqlitedb.BusyTimeoutMS
 	realtimeLagWindow = 60 * time.Second
 	jobHeartbeatStale = 2 * time.Minute
 )
@@ -91,6 +86,8 @@ type Status struct {
 	ProgressTotalRows   int64   `json:"progress_total_rows,omitempty"`
 	ProgressTables      int     `json:"progress_tables,omitempty"`
 	ProgressTotalTables int     `json:"progress_total_tables,omitempty"`
+	CheckedTables       int     `json:"checked_tables,omitempty"`
+	CoveredTables       int     `json:"covered_tables,omitempty"`
 	ProgressCurrent     string  `json:"progress_current,omitempty"`
 	ProgressUpdatedAt   string  `json:"progress_updated_at,omitempty"`
 }
@@ -157,10 +154,6 @@ type sourceRow struct {
 	TableCount   int    `json:"table_count"`
 }
 
-type tableRow struct {
-	Name string `json:"name"`
-}
-
 type indexStatsRow struct {
 	SchemaVersion string `json:"schema_version"`
 	State         string `json:"state"`
@@ -179,10 +172,6 @@ type refRow struct {
 	TableName    string `json:"table_name"`
 	ChatUsername string `json:"chat_username"`
 	LocalID      int64  `json:"local_id"`
-}
-
-type countRow struct {
-	Count int64 `json:"count"`
 }
 
 type sourceStat struct {
@@ -221,10 +210,6 @@ type tableWatermarkRow struct {
 	MaxCreateTime int64
 }
 
-type maxLocalIDRow struct {
-	MaxLocalID int64 `json:"max_local_id"`
-}
-
 type tableKeyRow struct {
 	SourceDB  string `json:"source_db"`
 	TableName string `json:"table_name"`
@@ -252,23 +237,23 @@ type refreshTablePlan struct {
 }
 
 type buildProgress struct {
-	Status           string  `json:"status"`
-	JobID            string  `json:"job_id,omitempty"`
-	PID              int     `json:"pid,omitempty"`
-	StartedAt        string  `json:"started_at"`
-	UpdatedAt        string  `json:"updated_at"`
-	Account          string  `json:"account"`
-	IndexPath        string  `json:"index_path"`
-	TempPath         string  `json:"temp_path,omitempty"`
-	CurrentSourceDB  string  `json:"current_source_db,omitempty"`
-	CurrentTable     string  `json:"current_table,omitempty"`
-	TotalSources     int     `json:"total_sources"`
-	CompletedSources int     `json:"completed_sources"`
-	TotalTables      int     `json:"total_tables"`
-	CompletedTables  int     `json:"completed_tables"`
-	TotalRows        int64   `json:"total_rows"`
-	IndexedRows      int64   `json:"indexed_rows"`
-	Percent          float64 `json:"percent"`
+	Status          string  `json:"status"`
+	JobID           string  `json:"job_id,omitempty"`
+	PID             int     `json:"pid,omitempty"`
+	StartedAt       string  `json:"started_at"`
+	UpdatedAt       string  `json:"updated_at"`
+	Account         string  `json:"account"`
+	IndexPath       string  `json:"index_path"`
+	TempPath        string  `json:"temp_path,omitempty"`
+	CurrentSourceDB string  `json:"current_source_db,omitempty"`
+	CurrentTable    string  `json:"current_table,omitempty"`
+	TotalSources    int     `json:"total_sources"`
+	TotalTables     int     `json:"total_tables"`
+	CheckedTables   int     `json:"checked_tables"`
+	CoveredTables   int     `json:"covered_tables"`
+	TotalRows       int64   `json:"total_rows"`
+	IndexedRows     int64   `json:"indexed_rows"`
+	Percent         float64 `json:"percent"`
 }
 
 type progressTracker struct {
@@ -286,7 +271,7 @@ type sourceMessageRow struct {
 	SenderName   string
 	Status       int64
 	CreateTime   int64
-	ContentHex   string
+	Content      []byte
 }
 
 type UsabilityOptions struct {
@@ -712,24 +697,28 @@ func MessageRefs(ctx context.Context, indexPath string, query MessageQuery) ([]m
 		return nil, fmt.Errorf("%w: chat table is not indexed", ErrUnavailable)
 	}
 
-	clauses := []string{"table_name = " + sqlLiteral(tableName)}
+	clauses := []string{"table_name = ?"}
+	args := []any{tableName}
 	if query.HasStart {
-		clauses = append(clauses, fmt.Sprintf("create_time >= %d", query.Start))
+		clauses = append(clauses, "create_time >= ?")
+		args = append(args, query.Start)
 	}
 	if query.HasEnd {
-		clauses = append(clauses, fmt.Sprintf("create_time <= %d", query.End))
+		clauses = append(clauses, "create_time <= ?")
+		args = append(args, query.End)
 	}
 	if query.HasAfterSeq {
-		clauses = append(clauses, fmt.Sprintf("sort_seq > %d", query.AfterSeq))
+		clauses = append(clauses, "sort_seq > ?")
+		args = append(args, query.AfterSeq)
 	}
-	sql := `
+	stmt := `
 SELECT source_db, table_name, chat_username, local_id
 FROM message_index
 WHERE ` + strings.Join(clauses, " AND ") + `
 ORDER BY create_time ASC, sort_seq ASC, local_id ASC, source_db ASC`
-	sql += limitOffsetSQL(query.Limit, query.Offset)
-	sql += ";"
-	return queryRefs(ctx, indexPath, sql)
+	stmt += limitOffsetSQL(query.Limit, query.Offset)
+	stmt += ";"
+	return queryRefs(ctx, indexPath, stmt, args...)
 }
 
 func HasChat(ctx context.Context, indexPath string, username string) (bool, error) {
@@ -778,21 +767,28 @@ func TimelineRefs(ctx context.Context, indexPath string, query TimelineQuery) ([
 		return []messages.RowRef{}, nil
 	}
 	sort.Strings(tableNames)
+	args := make([]any, 0, len(tableNames)+4)
+	for _, tableName := range tableNames {
+		args = append(args, tableName)
+	}
 	clauses := []string{
-		"table_name IN (" + sqlLiteralList(tableNames) + ")",
-		fmt.Sprintf("create_time >= %d", query.Start),
-		fmt.Sprintf("create_time <= %d", query.End),
+		"table_name IN (" + sqlitedb.Placeholders(len(tableNames)) + ")",
+		"create_time >= ?",
+		"create_time <= ?",
 	}
+	args = append(args, query.Start, query.End)
 	if query.HasAfter {
-		clauses = append(clauses, timelineAfterSQL(query.After))
+		afterSQL, afterArgs := timelineAfterSQL(query.After)
+		clauses = append(clauses, afterSQL)
+		args = append(args, afterArgs...)
 	}
-	sql := `
+	stmt := `
 SELECT source_db, table_name, chat_username, local_id
 FROM message_index
 WHERE ` + strings.Join(clauses, " AND ") + `
 ORDER BY create_time ASC, sort_seq ASC, chat_username ASC, local_id ASC, source_db ASC
 LIMIT ` + strconv.Itoa(query.Limit) + ";"
-	return queryRefs(ctx, indexPath, sql)
+	return queryRefs(ctx, indexPath, stmt, args...)
 }
 
 func SearchRefs(ctx context.Context, indexPath string, query SearchQuery) ([]messages.RowRef, int, error) {
@@ -806,7 +802,8 @@ func SearchRefs(ctx context.Context, indexPath string, query SearchQuery) ([]mes
 	if !ftsQuerySupported(needle) {
 		return nil, 0, fmt.Errorf("%w: query is not suitable for FTS fast path", ErrUnavailable)
 	}
-	clauses := []string{"message_fts MATCH " + sqlLiteral(ftsPhrase(needle))}
+	clauses := []string{"message_fts MATCH ?"}
+	args := []any{ftsPhrase(needle)}
 	if len(query.Chats) > 0 {
 		usernames := make([]string, 0, len(query.Chats))
 		seen := map[string]bool{}
@@ -822,27 +819,32 @@ func SearchRefs(ctx context.Context, indexPath string, query SearchQuery) ([]mes
 			return []messages.RowRef{}, 0, nil
 		}
 		sort.Strings(usernames)
-		clauses = append(clauses, "chat_username IN ("+sqlLiteralList(usernames)+")")
+		clauses = append(clauses, "chat_username IN ("+sqlitedb.Placeholders(len(usernames))+")")
+		for _, username := range usernames {
+			args = append(args, username)
+		}
 	}
 	if query.HasStart {
-		clauses = append(clauses, fmt.Sprintf("create_time >= %d", query.Start))
+		clauses = append(clauses, "create_time >= ?")
+		args = append(args, query.Start)
 	}
 	if query.HasEnd {
-		clauses = append(clauses, fmt.Sprintf("create_time <= %d", query.End))
+		clauses = append(clauses, "create_time <= ?")
+		args = append(args, query.End)
 	}
 	where := strings.Join(clauses, " AND ")
-	total, err := queryCount(ctx, indexPath, "SELECT count(*) AS count FROM message_fts WHERE "+where+";")
+	total, err := queryCount(ctx, indexPath, "SELECT count(*) FROM message_fts WHERE "+where+";", args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
-	sql := `
+	stmt := `
 SELECT source_db, table_name, chat_username, local_id
 FROM message_fts
 WHERE ` + where + `
 ORDER BY create_time DESC, sort_seq DESC, local_id DESC, source_db ASC`
-	sql += limitOffsetSQL(query.Limit, query.Offset)
-	sql += ";"
-	refs, err := queryRefs(ctx, indexPath, sql)
+	stmt += limitOffsetSQL(query.Limit, query.Offset)
+	stmt += ";"
+	refs, err := queryRefs(ctx, indexPath, stmt, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
@@ -928,9 +930,9 @@ func buildOrResumeIndex(ctx context.Context, opts BuildOptions, tableToChat map[
 		return err
 	}
 	tracker.progress.IndexedRows = currentRows
-	tracker.progress.CompletedTables = minInt(len(completedTables), totalTables)
+	tracker.progress.CoveredTables = minInt(len(completedTables), totalTables)
 	if totalTables > 0 {
-		tracker.progress.Percent = float64(tracker.progress.CompletedTables) * 100 / float64(totalTables)
+		tracker.progress.Percent = float64(tracker.progress.CoveredTables) * 100 / float64(totalTables)
 	}
 	if err := tracker.write(); err != nil {
 		return err
@@ -953,15 +955,12 @@ func buildOrResumeIndex(ctx context.Context, opts BuildOptions, tableToChat map[
 			}
 			if !alreadyCompleted {
 				completedTables[progressKey] = true
-				if err := tracker.finishTable(); err != nil {
-					return err
-				}
+			}
+			if err := tracker.finishTable(len(completedTables)); err != nil {
+				return err
 			}
 		}
-		if err := execIndexSQL(ctx, indexPath, refreshSourceSQL(source.Stat, indexedAt)); err != nil {
-			return err
-		}
-		if err := tracker.finishSource(); err != nil {
+		if err := refreshSource(ctx, indexPath, source.Stat, indexedAt); err != nil {
 			return err
 		}
 	}
@@ -1008,6 +1007,11 @@ func refreshReadyIndex(ctx context.Context, opts BuildOptions, tableToChat map[s
 	if err := tracker.write(); err != nil {
 		return err
 	}
+	completedTables, err := indexedCompletedTableKeys(ctx, indexPath)
+	if err != nil {
+		return err
+	}
+	tracker.progress.CoveredTables = len(completedTables)
 	indexedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, source := range plan {
 		for _, table := range source.Tables {
@@ -1018,14 +1022,15 @@ func refreshReadyIndex(ctx context.Context, opts BuildOptions, tableToChat map[s
 			if err != nil {
 				return err
 			}
-			if err := tracker.finishTable(); err != nil {
+			progressKey := indexedTableKey(source.Stat.SourceDB, table.Name)
+			if !completedTables[progressKey] {
+				completedTables[progressKey] = true
+			}
+			if err := tracker.finishTable(len(completedTables)); err != nil {
 				return err
 			}
 		}
-		if err := execIndexSQL(ctx, indexPath, refreshSourceSQL(source.Stat, indexedAt)); err != nil {
-			return err
-		}
-		if err := tracker.finishSource(); err != nil {
+		if err := refreshSource(ctx, indexPath, source.Stat, indexedAt); err != nil {
 			return err
 		}
 	}
@@ -1046,34 +1051,68 @@ func refreshReadyIndex(ctx context.Context, opts BuildOptions, tableToChat map[s
 }
 
 func indexTableIncrementalTx(ctx context.Context, indexPath string, dbPath string, sourceDB string, tableName string, chatUsername string, afterLocalID int64, tracker *progressTracker) (int64, error) {
-	cmd := exec.CommandContext(ctx, "sqlite3", indexPath)
-	stdin, err := cmd.StdinPipe()
+	indexDB, err := sqlitedb.OpenReadWrite(ctx, indexPath)
 	if err != nil {
 		return 0, err
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	defer indexDB.Close()
+	tx, err := indexDB.BeginTx(ctx, nil)
+	if err != nil {
 		return 0, err
 	}
-	writer := bufio.NewWriterSize(stdin, 1024*1024)
-	fail := func(indexErr error) (int64, error) {
-		_, _ = writer.WriteString("ROLLBACK;\n")
-		_ = writer.Flush()
-		_ = stdin.Close()
-		waitErr := cmd.Wait()
-		if waitErr != nil {
-			return 0, fmt.Errorf("%v; sqlite finalize: %v: %s", indexErr, waitErr, strings.TrimSpace(stderr.String()))
-		}
-		return 0, indexErr
+	rollback := func(cause error) (int64, error) {
+		_ = tx.Rollback()
+		return 0, cause
 	}
-	if _, err := writer.WriteString(fmt.Sprintf("PRAGMA busy_timeout=%d;\nBEGIN IMMEDIATE;\n", sqliteBusyTimeout)); err != nil {
-		return fail(err)
+	insertIndex, err := tx.PrepareContext(ctx, `
+INSERT OR IGNORE INTO message_index(source_db, table_name, chat_username, local_id, create_time, sort_seq, server_id, local_type, status, real_sender_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`)
+	if err != nil {
+		return rollback(err)
 	}
+	defer insertIndex.Close()
+	insertFTS, err := tx.PrepareContext(ctx, `
+INSERT INTO message_fts(search_text, source_db, table_name, chat_username, local_id, create_time, sort_seq)
+VALUES (?, ?, ?, ?, ?, ?, ?);`)
+	if err != nil {
+		return rollback(err)
+	}
+	defer insertFTS.Close()
 	var added int64
 	if err := streamSourceRowsAfter(ctx, dbPath, tableName, afterLocalID, func(row sourceMessageRow) error {
-		if err := writeIndexedMessageRow(writer, sourceDB, tableName, chatUsername, row); err != nil {
-			return err
+		decoded, _ := messages.DecodeContent(row.Content)
+		result, err := insertIndex.ExecContext(ctx,
+			sourceDB,
+			tableName,
+			chatUsername,
+			row.LocalID,
+			row.CreateTime,
+			row.SortSeq,
+			row.ServerID,
+			row.LocalType,
+			row.Status,
+			row.RealSenderID,
+		)
+		if err != nil {
+			return fmt.Errorf("insert message index source_db=%s table=%s local_id=%d: %w", sourceDB, tableName, row.LocalID, err)
+		}
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			return nil
+		}
+		searchText := messages.SearchText(chatUsername, row.LocalType, row.Status, row.RealSenderID, row.SenderName, decoded)
+		if strings.TrimSpace(searchText) != "" {
+			if _, err := insertFTS.ExecContext(ctx,
+				searchText,
+				sourceDB,
+				tableName,
+				chatUsername,
+				row.LocalID,
+				row.CreateTime,
+				row.SortSeq,
+			); err != nil {
+				return fmt.Errorf("insert message FTS source_db=%s table=%s local_id=%d: %w", sourceDB, tableName, row.LocalID, err)
+			}
 		}
 		added++
 		if tracker != nil {
@@ -1081,22 +1120,13 @@ func indexTableIncrementalTx(ctx context.Context, indexPath string, dbPath strin
 		}
 		return nil
 	}); err != nil {
-		return fail(err)
+		return rollback(err)
 	}
-	if _, err := writer.WriteString(refreshChatTableSQL(sourceDB, tableName, chatUsername)); err != nil {
-		return fail(err)
+	if err := refreshChatTableTx(ctx, tx, sourceDB, tableName, chatUsername); err != nil {
+		return rollback(err)
 	}
-	if _, err := writer.WriteString("COMMIT;\n"); err != nil {
-		return fail(err)
-	}
-	if err := writer.Flush(); err != nil {
-		return fail(err)
-	}
-	if err := stdin.Close(); err != nil {
-		return 0, err
-	}
-	if err := cmd.Wait(); err != nil {
-		return 0, fmt.Errorf("write message index: %v: %s", err, strings.TrimSpace(stderr.String()))
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit message index source_db=%s table=%s: %w", sourceDB, tableName, err)
 	}
 	return added, nil
 }
@@ -1137,45 +1167,61 @@ func initializeIndexDB(ctx context.Context, indexPath string, account string, st
 	if err := os.MkdirAll(filepath.Dir(indexPath), 0o700); err != nil {
 		return err
 	}
-	sql := schemaSQL()
-	sql += "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version'," + sqlLiteral(strconv.Itoa(SchemaVersion)) + ");\n"
-	sql += "INSERT OR REPLACE INTO meta(key, value) VALUES ('account'," + sqlLiteral(account) + ");\n"
-	sql += "INSERT OR REPLACE INTO meta(key, value) VALUES ('state'," + sqlLiteral(state) + ");\n"
-	return execIndexSQL(ctx, indexPath, sql)
-}
-
-func execIndexSQL(ctx context.Context, indexPath string, sql string) error {
-	cmd := exec.CommandContext(ctx, "sqlite3", indexPath)
-	cmd.Stdin = strings.NewReader(fmt.Sprintf("PRAGMA busy_timeout=%d;\n%s", sqliteBusyTimeout, sql))
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
 	if err != nil {
-		return fmt.Errorf("sqlite exec %s: %v: %s", indexPath, err, bytes.TrimSpace(out))
+		return err
 	}
-	return nil
+	defer db.Close()
+	if err := sqlitedb.ExecScript(ctx, db, schemaSQL()); err != nil {
+		return fmt.Errorf("initialize message index schema: %w", err)
+	}
+	return setMetaDB(ctx, db, map[string]string{
+		"schema_version": strconv.Itoa(SchemaVersion),
+		"account":        account,
+		"state":          state,
+	})
 }
 
 func setMeta(ctx context.Context, indexPath string, values map[string]string) error {
-	var sql strings.Builder
-	sql.WriteString("BEGIN;\n")
-	for key, value := range values {
-		sql.WriteString("INSERT OR REPLACE INTO meta(key, value) VALUES (")
-		sql.WriteString(sqlLiteral(key))
-		sql.WriteString(",")
-		sql.WriteString(sqlLiteral(value))
-		sql.WriteString(");\n")
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
+		return err
 	}
-	sql.WriteString("COMMIT;\n")
-	return execIndexSQL(ctx, indexPath, sql.String())
+	defer db.Close()
+	return setMetaDB(ctx, db, values)
+}
+
+func setMetaDB(ctx context.Context, db *sql.DB, values map[string]string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?);")
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	for key, value := range values {
+		if _, err := stmt.ExecContext(ctx, key, value); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func metaValue(ctx context.Context, indexPath string, key string) string {
-	var rows []struct {
-		Value string `json:"value"`
-	}
-	if err := queryJSON(ctx, indexPath, "SELECT value FROM meta WHERE key = "+sqlLiteral(key)+" LIMIT 1;", &rows); err != nil || len(rows) == 0 {
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
 		return ""
 	}
-	return rows[0].Value
+	defer db.Close()
+	var value string
+	if err := db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = ? LIMIT 1;", key).Scan(&value); err != nil {
+		return ""
+	}
+	return value
 }
 
 func schemaSQL() string {
@@ -1293,17 +1339,27 @@ func prepareBuildPlan(ctx context.Context, paths []string, tableToChat map[strin
 }
 
 func listMessageTables(ctx context.Context, dbPath string) ([]string, error) {
-	var rows []tableRow
-	if err := queryJSON(ctx, dbPath, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%' ORDER BY name;", &rows); err != nil {
+	db, err := sqlitedb.OpenReadOnly(ctx, dbPath)
+	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(rows))
-	for _, row := range rows {
-		if msgTableRE.MatchString(row.Name) {
-			out = append(out, row.Name)
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%' ORDER BY name;")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		if msgTableRE.MatchString(name) {
+			out = append(out, name)
 		}
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func newProgressTracker(path string, account string, indexPath string, tempPath string, totalSources int, totalTables int, totalRows int64) *progressTracker {
@@ -1332,9 +1388,9 @@ func (t *progressTracker) startTable(sourceDB string, tableName string) error {
 
 func (t *progressTracker) setTotals(totalSources int, totalTables int, totalRows int64) error {
 	t.progress.TotalSources = totalSources
-	t.progress.CompletedSources = 0
 	t.progress.TotalTables = totalTables
-	t.progress.CompletedTables = 0
+	t.progress.CheckedTables = 0
+	t.progress.CoveredTables = 0
 	t.progress.TotalRows = totalRows
 	t.progress.IndexedRows = 0
 	t.progress.CurrentSourceDB = ""
@@ -1361,19 +1417,15 @@ func (t *progressTracker) addRow() error {
 	return t.write()
 }
 
-func (t *progressTracker) finishTable() error {
-	t.progress.CompletedTables++
+func (t *progressTracker) finishTable(coveredTables int) error {
+	t.progress.CheckedTables++
+	t.progress.CoveredTables = coveredTables
 	if t.progress.TotalRows <= 0 && t.progress.TotalTables > 0 {
-		t.progress.Percent = float64(t.progress.CompletedTables) * 100 / float64(t.progress.TotalTables)
+		t.progress.Percent = float64(t.progress.CoveredTables) * 100 / float64(t.progress.TotalTables)
 		if t.progress.Percent > 100 {
 			t.progress.Percent = 100
 		}
 	}
-	return t.write()
-}
-
-func (t *progressTracker) finishSource() error {
-	t.progress.CompletedSources++
 	return t.write()
 }
 
@@ -1394,44 +1446,12 @@ func (t *progressTracker) write() error {
 	return nil
 }
 
-func writeIndexedMessageRow(writer *bufio.Writer, sourceDB string, tableName string, chatUsername string, row sourceMessageRow) error {
-	decoded, _ := decodeContentHex(row.ContentHex)
-	searchText := messages.SearchText(chatUsername, row.LocalType, row.Status, row.RealSenderID, row.SenderName, decoded)
-	if _, err := writer.WriteString(fmt.Sprintf(
-		"INSERT OR IGNORE INTO message_index(source_db, table_name, chat_username, local_id, create_time, sort_seq, server_id, local_type, status, real_sender_id) VALUES (%s,%s,%s,%d,%d,%d,%d,%d,%d,%d);\n",
-		sqlLiteral(sourceDB),
-		sqlLiteral(tableName),
-		sqlLiteral(chatUsername),
-		row.LocalID,
-		row.CreateTime,
-		row.SortSeq,
-		row.ServerID,
-		row.LocalType,
-		row.Status,
-		row.RealSenderID,
-	)); err != nil {
-		return err
-	}
-	if strings.TrimSpace(searchText) == "" {
-		return nil
-	}
-	_, err := writer.WriteString(fmt.Sprintf(
-		"INSERT INTO message_fts(search_text, source_db, table_name, chat_username, local_id, create_time, sort_seq) VALUES (%s,%s,%s,%s,%d,%d,%d);\n",
-		sqlLiteral(searchText),
-		sqlLiteral(sourceDB),
-		sqlLiteral(tableName),
-		sqlLiteral(chatUsername),
-		row.LocalID,
-		row.CreateTime,
-		row.SortSeq,
-	))
-	return err
-}
-
 func streamSourceRowsAfter(ctx context.Context, dbPath string, tableName string, afterLocalID int64, visit func(sourceMessageRow) error) error {
 	whereSQL := ""
+	args := []any{}
 	if afterLocalID >= 0 {
-		whereSQL = fmt.Sprintf("WHERE local_id > %d", afterLocalID)
+		whereSQL = "WHERE local_id > ?"
+		args = append(args, afterLocalID)
 	}
 	query := fmt.Sprintf(`
 SELECT
@@ -1443,98 +1463,44 @@ SELECT
   COALESCE((SELECT user_name FROM Name2Id WHERE rowid = COALESCE(real_sender_id, 0)), ''),
   COALESCE(status, 0),
   COALESCE(create_time, 0),
-  hex(COALESCE(message_content, X''))
-FROM [%s]
+  COALESCE(message_content, X'')
+FROM %s
 %s
 ORDER BY local_id ASC;
-`, tableName, whereSQL)
-	cmd := exec.CommandContext(ctx, "sqlite3", "-batch", "-noheader", "-separator", unitSep, "-newline", recordSep, sqlitecli.ImmutableURI(dbPath), query)
-	stdout, err := cmd.StdoutPipe()
+`, sqlitedb.QuoteIdent(tableName), whereSQL)
+	sourceDB, err := sqlitedb.OpenReadOnly(ctx, dbPath)
 	if err != nil {
 		return err
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return err
+	defer sourceDB.Close()
+	rows, err := sourceDB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("query source rows db=%s table=%s: %w", dbPath, tableName, err)
 	}
-	reader := bufio.NewReaderSize(stdout, 1024*1024)
-	for {
-		record, err := reader.ReadString(recordSep[0])
-		if len(record) > 0 {
-			record = strings.TrimSuffix(record, recordSep)
-			if strings.TrimSpace(record) != "" {
-				row, parseErr := parseSourceMessageRow(record)
-				if parseErr != nil {
-					_ = cmd.Process.Kill()
-					_ = cmd.Wait()
-					return parseErr
-				}
-				if visitErr := visit(row); visitErr != nil {
-					_ = cmd.Process.Kill()
-					_ = cmd.Wait()
-					return visitErr
-				}
-			}
+	defer rows.Close()
+	for rows.Next() {
+		var row sourceMessageRow
+		if err := rows.Scan(
+			&row.LocalID,
+			&row.LocalType,
+			&row.SortSeq,
+			&row.ServerID,
+			&row.RealSenderID,
+			&row.SenderName,
+			&row.Status,
+			&row.CreateTime,
+			&row.Content,
+		); err != nil {
+			return fmt.Errorf("scan source row db=%s table=%s: %w", dbPath, tableName, err)
 		}
-		if err == nil {
-			continue
+		if err := visit(row); err != nil {
+			return err
 		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return err
 	}
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("stream messages in %s: %v: %s", dbPath, err, strings.TrimSpace(stderr.String()))
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate source rows db=%s table=%s: %w", dbPath, tableName, err)
 	}
 	return nil
-}
-
-func parseSourceMessageRow(record string) (sourceMessageRow, error) {
-	parts := strings.Split(record, unitSep)
-	if len(parts) != 9 {
-		return sourceMessageRow{}, fmt.Errorf("unexpected sqlite row field count: got %d", len(parts))
-	}
-	var row sourceMessageRow
-	var err error
-	if row.LocalID, err = strconv.ParseInt(parts[0], 10, 64); err != nil {
-		return row, err
-	}
-	if row.LocalType, err = strconv.ParseInt(parts[1], 10, 64); err != nil {
-		return row, err
-	}
-	if row.SortSeq, err = strconv.ParseInt(parts[2], 10, 64); err != nil {
-		return row, err
-	}
-	if row.ServerID, err = strconv.ParseInt(parts[3], 10, 64); err != nil {
-		return row, err
-	}
-	if row.RealSenderID, err = strconv.ParseInt(parts[4], 10, 64); err != nil {
-		return row, err
-	}
-	row.SenderName = parts[5]
-	if row.Status, err = strconv.ParseInt(parts[6], 10, 64); err != nil {
-		return row, err
-	}
-	if row.CreateTime, err = strconv.ParseInt(parts[7], 10, 64); err != nil {
-		return row, err
-	}
-	row.ContentHex = parts[8]
-	return row, nil
-}
-
-func decodeContentHex(contentHex string) (string, string) {
-	if contentHex == "" {
-		return "", "text"
-	}
-	raw, err := hex.DecodeString(contentHex)
-	if err != nil {
-		return "", "invalid_hex"
-	}
-	return messages.DecodeContent(raw)
 }
 
 func indexStats(ctx context.Context, indexPath string) (indexStatsRow, error) {
@@ -1551,63 +1517,112 @@ SELECT
   (SELECT count(DISTINCT chat_username) FROM chat_table) AS covered_chats,
   COALESCE((SELECT max(create_time) FROM message_index), 0) AS max_create_time;
 `
-	var rows []indexStatsRow
-	if err := queryJSON(ctx, indexPath, query, &rows); err != nil {
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
 		return indexStatsRow{}, err
 	}
-	if len(rows) == 0 {
-		return indexStatsRow{}, fmt.Errorf("index stats query returned no rows")
+	defer db.Close()
+	var row indexStatsRow
+	if err := db.QueryRowContext(ctx, query).Scan(
+		&row.SchemaVersion,
+		&row.State,
+		&row.BuiltAt,
+		&row.RefreshedAt,
+		&row.SourceRows,
+		&row.SourceDBCount,
+		&row.IndexedRows,
+		&row.IndexedTables,
+		&row.CoveredChats,
+		&row.MaxCreateTime,
+	); err != nil {
+		return indexStatsRow{}, err
 	}
-	return rows[0], nil
+	return row, nil
 }
 
 func indexSources(ctx context.Context, indexPath string) ([]sourceRow, error) {
-	var rows []sourceRow
-	err := queryJSON(ctx, indexPath, "SELECT source_db, cache_path, cache_size, cache_mtime_ns, indexed_at, row_count, table_count FROM source_db ORDER BY source_db;", &rows)
-	return rows, err
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, "SELECT source_db, cache_path, cache_size, cache_mtime_ns, indexed_at, row_count, table_count FROM source_db ORDER BY source_db;")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []sourceRow{}
+	for rows.Next() {
+		var row sourceRow
+		if err := rows.Scan(&row.SourceDB, &row.CachePath, &row.CacheSize, &row.CacheMTimeNS, &row.IndexedAt, &row.RowCount, &row.TableCount); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 func chatTableExists(ctx context.Context, indexPath string, tableName string) (bool, error) {
-	count, err := queryCount(ctx, indexPath, "SELECT count(*) AS count FROM chat_table WHERE table_name = "+sqlLiteral(tableName)+";")
+	count, err := queryCount(ctx, indexPath, "SELECT count(*) FROM chat_table WHERE table_name = ?;", tableName)
 	return count > 0, err
 }
 
 func indexedMaxLocalID(ctx context.Context, indexPath string, sourceDB string, tableName string) (int64, error) {
-	sql := "SELECT COALESCE(max(local_id), -1) AS max_local_id FROM message_index WHERE source_db = " + sqlLiteral(sourceDB) + " AND table_name = " + sqlLiteral(tableName) + ";"
-	var rows []maxLocalIDRow
-	if err := queryJSON(ctx, indexPath, sql, &rows); err != nil {
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
 		return -1, err
 	}
-	if len(rows) == 0 {
-		return -1, nil
+	defer db.Close()
+	var maxLocalID int64
+	if err := db.QueryRowContext(ctx, "SELECT COALESCE(max(local_id), -1) FROM message_index WHERE source_db = ? AND table_name = ?;", sourceDB, tableName).Scan(&maxLocalID); err != nil {
+		return -1, err
 	}
-	return rows[0].MaxLocalID, nil
+	return maxLocalID, nil
 }
 
 func indexedCompletedTableKeys(ctx context.Context, indexPath string) (map[string]bool, error) {
-	var rows []tableKeyRow
-	err := queryJSON(ctx, indexPath, "SELECT source_db, table_name FROM chat_table;", &rows)
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]bool, len(rows))
-	for _, row := range rows {
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, "SELECT source_db, table_name FROM chat_table;")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var row tableKeyRow
+		if err := rows.Scan(&row.SourceDB, &row.TableName); err != nil {
+			return nil, err
+		}
 		out[indexedTableKey(row.SourceDB, row.TableName)] = true
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func indexedTableKey(sourceDB string, tableName string) string {
 	return sourceDB + unitSep + tableName
 }
 
-func queryRefs(ctx context.Context, indexPath string, sql string) ([]messages.RowRef, error) {
-	var rows []refRow
-	if err := queryJSON(ctx, indexPath, sql, &rows); err != nil {
+func queryRefs(ctx context.Context, indexPath string, query string, args ...any) ([]messages.RowRef, error) {
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
 		return nil, err
 	}
-	out := make([]messages.RowRef, 0, len(rows))
-	for _, row := range rows {
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []messages.RowRef{}
+	for rows.Next() {
+		var row refRow
+		if err := rows.Scan(&row.SourceDB, &row.TableName, &row.ChatUsername, &row.LocalID); err != nil {
+			return nil, err
+		}
 		out = append(out, messages.RowRef{
 			SourceDB:     row.SourceDB,
 			TableName:    row.TableName,
@@ -1615,33 +1630,23 @@ func queryRefs(ctx context.Context, indexPath string, sql string) ([]messages.Ro
 			LocalID:      row.LocalID,
 		})
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
-func queryCount(ctx context.Context, dbPath string, sql string) (int64, error) {
-	var rows []countRow
-	if err := queryJSON(ctx, dbPath, sql, &rows); err != nil {
+func queryCount(ctx context.Context, dbPath string, query string, args ...any) (int64, error) {
+	db, err := sqlitedb.OpenReadWrite(ctx, dbPath)
+	if err != nil {
 		return 0, err
 	}
-	if len(rows) == 0 {
-		return 0, nil
+	defer db.Close()
+	var count int64
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
 	}
-	return rows[0].Count, nil
-}
-
-func queryJSON(ctx context.Context, dbPath string, sql string, target any) error {
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), sql)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("sqlite query %s: %v: %s", dbPath, err, bytes.TrimSpace(out))
-	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return json.Unmarshal([]byte("[]"), target)
-	}
-	if err := json.Unmarshal(out, target); err != nil {
-		return fmt.Errorf("parse sqlite json: %w", err)
-	}
-	return nil
+	return count, nil
 }
 
 func currentSourceStats(paths []string) ([]sourceStat, string, error) {
@@ -1707,77 +1712,21 @@ func queryTableWatermarks(ctx context.Context, dbPath string, tables []string) (
 	if len(tables) == 0 {
 		return nil, nil
 	}
-	cmd := exec.CommandContext(ctx, "sqlite3", "-batch", "-noheader", "-separator", unitSep, "-newline", recordSep, sqlitecli.ImmutableURI(dbPath))
-	stdin, err := cmd.StdinPipe()
+	db, err := sqlitedb.OpenReadOnly(ctx, dbPath)
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	go func() {
-		writer := bufio.NewWriterSize(stdin, 1024*1024)
-		for _, table := range tables {
-			_, _ = writer.WriteString(fmt.Sprintf("SELECT %s, count(*), COALESCE(max(local_id), -1), COALESCE(max(create_time), 0) FROM [%s];\n", sqlLiteral(table), table))
-		}
-		_ = writer.Flush()
-		_ = stdin.Close()
-	}()
-	reader := bufio.NewReaderSize(stdout, 1024*1024)
+	defer db.Close()
 	rows := make([]tableWatermarkRow, 0, len(tables))
-	for {
-		record, err := reader.ReadString(recordSep[0])
-		if len(record) > 0 {
-			record = strings.TrimSuffix(record, recordSep)
-			if strings.TrimSpace(record) != "" {
-				row, parseErr := parseTableWatermark(record)
-				if parseErr != nil {
-					_ = cmd.Process.Kill()
-					_ = cmd.Wait()
-					return nil, parseErr
-				}
-				rows = append(rows, row)
-			}
+	for _, table := range tables {
+		query := fmt.Sprintf("SELECT count(*), COALESCE(max(local_id), -1), COALESCE(max(create_time), 0) FROM %s;", sqlitedb.QuoteIdent(table))
+		row := tableWatermarkRow{TableName: table}
+		if err := db.QueryRowContext(ctx, query).Scan(&row.RowCount, &row.MaxLocalID, &row.MaxCreateTime); err != nil {
+			return nil, fmt.Errorf("scan source watermark db=%s table=%s: %w", dbPath, table, err)
 		}
-		if err == nil {
-			continue
-		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return nil, err
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("scan source watermarks in %s: %v: %s", dbPath, err, strings.TrimSpace(stderr.String()))
+		rows = append(rows, row)
 	}
 	return rows, nil
-}
-
-func parseTableWatermark(record string) (tableWatermarkRow, error) {
-	parts := strings.Split(record, unitSep)
-	if len(parts) != 4 {
-		return tableWatermarkRow{}, fmt.Errorf("unexpected source watermark field count: got %d", len(parts))
-	}
-	row := tableWatermarkRow{TableName: parts[0]}
-	var err error
-	if row.RowCount, err = strconv.ParseInt(parts[1], 10, 64); err != nil {
-		return row, err
-	}
-	if row.MaxLocalID, err = strconv.ParseInt(parts[2], 10, 64); err != nil {
-		return row, err
-	}
-	if row.MaxCreateTime, err = strconv.ParseInt(parts[3], 10, 64); err != nil {
-		return row, err
-	}
-	return row, nil
 }
 
 func baseStatus(indexPath string) Status {
@@ -2059,8 +2008,10 @@ func statusFromProgressLegacy(indexPath string, progress buildProgress, temp sou
 		ProgressPercent:     progress.Percent,
 		ProgressRows:        progress.IndexedRows,
 		ProgressTotalRows:   progress.TotalRows,
-		ProgressTables:      progress.CompletedTables,
+		ProgressTables:      progress.CheckedTables,
 		ProgressTotalTables: progress.TotalTables,
+		CheckedTables:       progress.CheckedTables,
+		CoveredTables:       progress.CoveredTables,
 		ProgressUpdatedAt:   progress.UpdatedAt,
 	}
 	if progress.CurrentSourceDB != "" || progress.CurrentTable != "" {
@@ -2107,6 +2058,9 @@ func mergeProgressStatus(progress Status, indexed Status) Status {
 	if progress.IndexedRows > progress.ProgressRows {
 		progress.ProgressRows = progress.IndexedRows
 	}
+	if progress.IndexedTables > progress.CoveredTables {
+		progress.CoveredTables = progress.IndexedTables
+	}
 	if progress.IndexedTables > progress.ProgressTables {
 		progress.ProgressTables = progress.IndexedTables
 		if progress.ProgressTotalTables > 0 {
@@ -2138,18 +2092,6 @@ func parseSchemaVersion(value string) int {
 	return n
 }
 
-func sqlLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-}
-
-func sqlLiteralList(values []string) string {
-	quoted := make([]string, 0, len(values))
-	for _, value := range values {
-		quoted = append(quoted, sqlLiteral(value))
-	}
-	return strings.Join(quoted, ",")
-}
-
 func limitOffsetSQL(limit int, offset int) string {
 	if limit <= 0 {
 		if offset > 0 {
@@ -2164,47 +2106,57 @@ func limitOffsetSQL(limit int, offset int) string {
 	return out
 }
 
-func refreshChatTableSQL(sourceDB string, tableName string, chatUsername string) string {
-	sourceLit := sqlLiteral(sourceDB)
-	tableLit := sqlLiteral(tableName)
-	return fmt.Sprintf(`
+func refreshChatTableTx(ctx context.Context, tx *sql.Tx, sourceDB string, tableName string, chatUsername string) error {
+	_, err := tx.ExecContext(ctx, `
 INSERT OR REPLACE INTO chat_table(table_name, chat_username, source_db, row_count, min_create_time, max_create_time, max_sort_seq, max_local_id)
-SELECT %s, %s, %s,
+SELECT ?, ?, ?,
   count(*),
   COALESCE(min(create_time), 0),
   COALESCE(max(create_time), 0),
   COALESCE(max(sort_seq), 0),
   COALESCE(max(local_id), 0)
 FROM message_index
-WHERE source_db = %s AND table_name = %s;
-`, tableLit, sqlLiteral(chatUsername), sourceLit, sourceLit, tableLit)
+WHERE source_db = ? AND table_name = ?;
+`, tableName, chatUsername, sourceDB, sourceDB, tableName)
+	if err != nil {
+		return fmt.Errorf("refresh chat table source_db=%s table=%s: %w", sourceDB, tableName, err)
+	}
+	return nil
 }
 
-func refreshSourceSQL(stat sourceStat, indexedAt string) string {
-	sourceLit := sqlLiteral(stat.SourceDB)
-	return fmt.Sprintf(`
+func refreshSource(ctx context.Context, indexPath string, stat sourceStat, indexedAt string) error {
+	db, err := sqlitedb.OpenReadWrite(ctx, indexPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.ExecContext(ctx, `
 INSERT OR REPLACE INTO source_db(source_db, cache_path, cache_size, cache_mtime_ns, indexed_at, row_count, table_count)
-VALUES (%s, %s, %d, %d, %s,
-  COALESCE((SELECT count(*) FROM message_index WHERE source_db = %s), 0),
-  COALESCE((SELECT count(*) FROM chat_table WHERE source_db = %s), 0)
+VALUES (?, ?, ?, ?, ?,
+  COALESCE((SELECT count(*) FROM message_index WHERE source_db = ?), 0),
+  COALESCE((SELECT count(*) FROM chat_table WHERE source_db = ?), 0)
 );
-`, sourceLit, sqlLiteral(stat.Path), stat.Size, stat.MTimeNS, sqlLiteral(indexedAt), sourceLit, sourceLit)
+`, stat.SourceDB, stat.Path, stat.Size, stat.MTimeNS, indexedAt, stat.SourceDB, stat.SourceDB)
+	if err != nil {
+		return fmt.Errorf("refresh index source metadata source_db=%s: %w", stat.SourceDB, err)
+	}
+	return nil
 }
 
-func timelineAfterSQL(after timeline.SortKey) string {
-	return fmt.Sprintf(`(
-  create_time > %d OR
-  (create_time = %d AND sort_seq > %d) OR
-  (create_time = %d AND sort_seq = %d AND chat_username > %s) OR
-  (create_time = %d AND sort_seq = %d AND chat_username = %s AND local_id > %d) OR
-  (create_time = %d AND sort_seq = %d AND chat_username = %s AND local_id = %d AND source_db > %s)
-)`,
-		after.CreateTime,
-		after.CreateTime, after.Seq,
-		after.CreateTime, after.Seq, sqlLiteral(after.ChatUsername),
-		after.CreateTime, after.Seq, sqlLiteral(after.ChatUsername), after.LocalID,
-		after.CreateTime, after.Seq, sqlLiteral(after.ChatUsername), after.LocalID, sqlLiteral(after.SourceDB),
-	)
+func timelineAfterSQL(after timeline.SortKey) (string, []any) {
+	return `(
+  create_time > ? OR
+  (create_time = ? AND sort_seq > ?) OR
+  (create_time = ? AND sort_seq = ? AND chat_username > ?) OR
+  (create_time = ? AND sort_seq = ? AND chat_username = ? AND local_id > ?) OR
+  (create_time = ? AND sort_seq = ? AND chat_username = ? AND local_id = ? AND source_db > ?)
+)`, []any{
+			after.CreateTime,
+			after.CreateTime, after.Seq,
+			after.CreateTime, after.Seq, after.ChatUsername,
+			after.CreateTime, after.Seq, after.ChatUsername, after.LocalID,
+			after.CreateTime, after.Seq, after.ChatUsername, after.LocalID, after.SourceDB,
+		}
 }
 
 func ftsPhrase(value string) string {

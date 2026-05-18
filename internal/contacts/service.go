@@ -1,17 +1,16 @@
 package contacts
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
 
 const (
@@ -108,37 +107,42 @@ SELECT
 FROM contact
 ORDER BY COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), username) COLLATE NOCASE;
 `
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), query)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
-		return nil, fmt.Errorf("query contact cache: %v: %s", err, bytes.TrimSpace(out))
+		return nil, err
 	}
-	var rows []struct {
-		ID        int    `json:"id"`
-		Username  string `json:"username"`
-		LocalType int    `json:"local_type"`
-		Alias     string `json:"alias"`
-		Remark    string `json:"remark"`
-		NickName  string `json:"nick_name"`
-		HeadURL   string `json:"head_url"`
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query contact cache: %w", err)
 	}
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil, fmt.Errorf("parse sqlite json: %w", err)
-	}
+	defer rows.Close()
 	ownerUsername := ownerUsernameFromCachePath(s.CacheDB)
-	contacts := make([]Contact, 0, len(rows))
-	for _, row := range rows {
+	contacts := []Contact{}
+	for rows.Next() {
+		var (
+			id        int
+			username  string
+			localType int
+			alias     string
+			remark    string
+			nickName  string
+			headURL   string
+		)
+		if err := rows.Scan(&id, &username, &localType, &alias, &remark, &nickName, &headURL); err != nil {
+			return nil, err
+		}
 		contact := Contact{
-			Username: row.Username,
-			Alias:    row.Alias,
-			Remark:   row.Remark,
-			NickName: row.NickName,
-			HeadURL:  row.HeadURL,
-			Kind:     ClassifyKindForAccount(row.Username, row.LocalType, row.ID, ownerUsername),
+			Username: username,
+			Alias:    alias,
+			Remark:   remark,
+			NickName: nickName,
+			HeadURL:  headURL,
+			Kind:     ClassifyKindForAccount(username, localType, id, ownerUsername),
 		}
 		contacts = append(contacts, contact)
 	}
-	return contacts, nil
+	return contacts, rows.Err()
 }
 
 func (s Service) Detail(ctx context.Context, username string) (Detail, error) {
@@ -149,46 +153,57 @@ func (s Service) Detail(ctx context.Context, username string) (Detail, error) {
 	if err := s.ensureCache(); err != nil {
 		return Detail{}, err
 	}
-	query := fmt.Sprintf(`
+	query := `
 SELECT
-  COALESCE(id, 0) AS id,
+  COALESCE(id, 0),
   username,
-  COALESCE(local_type, 0) AS local_type,
-  COALESCE(alias, '') AS alias,
-  COALESCE(remark, '') AS remark,
-  COALESCE(nick_name, '') AS nick_name,
-  COALESCE(small_head_url, '') AS small_head_url,
-  COALESCE(big_head_url, '') AS big_head_url,
-  COALESCE(description, '') AS description,
-  COALESCE(verify_flag, 0) AS verify_flag
+  COALESCE(local_type, 0),
+  COALESCE(alias, ''),
+  COALESCE(remark, ''),
+  COALESCE(nick_name, ''),
+  COALESCE(small_head_url, ''),
+  COALESCE(big_head_url, ''),
+  COALESCE(description, ''),
+  COALESCE(verify_flag, 0)
 FROM contact
-WHERE username = %s
+WHERE username = ?
 LIMIT 1;
-`, sqlQuote(username))
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), query)
-	out, err := cmd.CombinedOutput()
+`
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
-		return Detail{}, fmt.Errorf("query contact detail: %v: %s", err, bytes.TrimSpace(out))
+		return Detail{}, err
 	}
-	var rows []struct {
-		ID          int    `json:"id"`
-		Username    string `json:"username"`
-		LocalType   int    `json:"local_type"`
-		Alias       string `json:"alias"`
-		Remark      string `json:"remark"`
-		NickName    string `json:"nick_name"`
-		SmallHead   string `json:"small_head_url"`
-		BigHead     string `json:"big_head_url"`
-		Description string `json:"description"`
-		VerifyFlag  int    `json:"verify_flag"`
+	defer db.Close()
+	var row struct {
+		ID          int
+		Username    string
+		LocalType   int
+		Alias       string
+		Remark      string
+		NickName    string
+		SmallHead   string
+		BigHead     string
+		Description string
+		VerifyFlag  int
 	}
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return Detail{}, fmt.Errorf("parse sqlite json: %w", err)
-	}
-	if len(rows) == 0 {
+	err = db.QueryRowContext(ctx, query, username).Scan(
+		&row.ID,
+		&row.Username,
+		&row.LocalType,
+		&row.Alias,
+		&row.Remark,
+		&row.NickName,
+		&row.SmallHead,
+		&row.BigHead,
+		&row.Description,
+		&row.VerifyFlag,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
 		return Detail{}, fmt.Errorf("contact not found: %s", username)
 	}
-	row := rows[0]
+	if err != nil {
+		return Detail{}, fmt.Errorf("query contact detail: %w", err)
+	}
 	ownerUsername := ownerUsernameFromCachePath(s.CacheDB)
 	kind := ClassifyKindForAccount(row.Username, row.LocalType, row.ID, ownerUsername)
 	return Detail{
@@ -272,46 +287,38 @@ func (s Service) ensureCache() error {
 }
 
 func (s Service) tableExists(ctx context.Context, table string) (bool, error) {
-	query := fmt.Sprintf("SELECT name FROM sqlite_master WHERE type='table' AND name=%s LIMIT 1;", sqlQuote(table))
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), query)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
-		return false, fmt.Errorf("query table %s: %v: %s", table, err, bytes.TrimSpace(out))
+		return false, err
 	}
-	var rows []struct {
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return false, fmt.Errorf("parse sqlite json: %w", err)
-	}
-	return len(rows) > 0, nil
+	defer db.Close()
+	return sqlitedb.TableExists(ctx, db, table)
 }
 
 func (s Service) chatroomIdentity(ctx context.Context, username string) (int, string, error) {
-	query := fmt.Sprintf(`
+	query := `
 SELECT
-  COALESCE(id, 0) AS id,
-  COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), NULLIF(alias, ''), username) AS display_name
+  COALESCE(id, 0),
+  COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), NULLIF(alias, ''), username)
 FROM contact
-WHERE username = %s
+WHERE username = ?
 LIMIT 1;
-`, sqlQuote(username))
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), query)
-	out, err := cmd.CombinedOutput()
+`
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
-		return 0, "", fmt.Errorf("query chatroom identity: %v: %s", err, bytes.TrimSpace(out))
+		return 0, "", err
 	}
-	var rows []struct {
-		ID          int    `json:"id"`
-		DisplayName string `json:"display_name"`
-	}
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return 0, "", fmt.Errorf("parse sqlite json: %w", err)
-	}
-	if len(rows) == 0 {
+	defer db.Close()
+	var id int
+	var displayName string
+	err = db.QueryRowContext(ctx, query, username).Scan(&id, &displayName)
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", nil
 	}
-	return rows[0].ID, rows[0].DisplayName, nil
+	if err != nil {
+		return 0, "", fmt.Errorf("query chatroom identity: %w", err)
+	}
+	return id, displayName, nil
 }
 
 func (s Service) chatroomOwner(ctx context.Context, roomID int, username string) (string, error) {
@@ -321,63 +328,71 @@ func (s Service) chatroomOwner(ctx context.Context, roomID int, username string)
 		return "", nil
 	}
 	queries := []string{
-		fmt.Sprintf("SELECT COALESCE(owner, '') AS owner FROM chat_room WHERE id = %d LIMIT 1;", roomID),
-		fmt.Sprintf("SELECT COALESCE(owner, '') AS owner FROM chat_room WHERE username = %s LIMIT 1;", sqlQuote(username)),
-		fmt.Sprintf("SELECT COALESCE(owner, '') AS owner FROM chat_room WHERE chat_room_name = %s LIMIT 1;", sqlQuote(username)),
-		fmt.Sprintf("SELECT COALESCE(owner, '') AS owner FROM chat_room WHERE name = %s LIMIT 1;", sqlQuote(username)),
+		"SELECT COALESCE(owner, '') FROM chat_room WHERE id = ? LIMIT 1;",
+		"SELECT COALESCE(owner, '') FROM chat_room WHERE username = ? LIMIT 1;",
+		"SELECT COALESCE(owner, '') FROM chat_room WHERE chat_room_name = ? LIMIT 1;",
+		"SELECT COALESCE(owner, '') FROM chat_room WHERE name = ? LIMIT 1;",
 	}
-	for _, query := range queries {
-		cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), query)
-		out, err := cmd.CombinedOutput()
+	args := []any{roomID, username, username, username}
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	for i, query := range queries {
+		var owner string
+		err := db.QueryRowContext(ctx, query, args[i]).Scan(&owner)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
 		if err != nil {
 			continue
 		}
-		var rows []struct {
-			Owner string `json:"owner"`
-		}
-		if err := json.Unmarshal(out, &rows); err != nil {
-			continue
-		}
-		if len(rows) > 0 && strings.TrimSpace(rows[0].Owner) != "" {
-			return rows[0].Owner, nil
+		if strings.TrimSpace(owner) != "" {
+			return owner, nil
 		}
 	}
 	return "", nil
 }
 
 func (s Service) chatroomMembers(ctx context.Context, roomID int, owner string) ([]Member, error) {
-	query := fmt.Sprintf(`
+	query := `
 SELECT
-  COALESCE(c.username, '') AS username,
-  COALESCE(c.alias, '') AS alias,
-  COALESCE(c.remark, '') AS remark,
-  COALESCE(c.nick_name, '') AS nick_name,
-  COALESCE(c.local_type, 0) AS local_type,
-  COALESCE(c.id, 0) AS contact_id
+  COALESCE(c.username, ''),
+  COALESCE(c.alias, ''),
+  COALESCE(c.remark, ''),
+  COALESCE(c.nick_name, ''),
+  COALESCE(c.local_type, 0),
+  COALESCE(c.id, 0)
 FROM chatroom_member cm
 LEFT JOIN contact c ON c.id = cm.member_id
-WHERE cm.room_id = %d
+WHERE cm.room_id = ?
 ORDER BY COALESCE(NULLIF(c.remark, ''), NULLIF(c.nick_name, ''), NULLIF(c.alias, ''), c.username) COLLATE NOCASE;
-`, roomID)
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), query)
-	out, err := cmd.CombinedOutput()
+`
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
-		return nil, fmt.Errorf("query chatroom members: %v: %s", err, bytes.TrimSpace(out))
+		return nil, err
 	}
-	var rows []struct {
-		Username  string `json:"username"`
-		Alias     string `json:"alias"`
-		Remark    string `json:"remark"`
-		NickName  string `json:"nick_name"`
-		LocalType int    `json:"local_type"`
-		ContactID int    `json:"contact_id"`
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, query, roomID)
+	if err != nil {
+		return nil, fmt.Errorf("query chatroom members: %w", err)
 	}
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil, fmt.Errorf("parse sqlite json: %w", err)
-	}
+	defer rows.Close()
 	ownerUsername := ownerUsernameFromCachePath(s.CacheDB)
-	members := make([]Member, 0, len(rows))
-	for _, row := range rows {
+	members := []Member{}
+	for rows.Next() {
+		var row struct {
+			Username  string
+			Alias     string
+			Remark    string
+			NickName  string
+			LocalType int
+			ContactID int
+		}
+		if err := rows.Scan(&row.Username, &row.Alias, &row.Remark, &row.NickName, &row.LocalType, &row.ContactID); err != nil {
+			return nil, err
+		}
 		if strings.TrimSpace(row.Username) == "" {
 			continue
 		}
@@ -390,6 +405,9 @@ ORDER BY COALESCE(NULLIF(c.remark, ''), NULLIF(c.nick_name, ''), NULLIF(c.alias,
 			Kind:        ClassifyKindForAccount(row.Username, row.LocalType, row.ContactID, ownerUsername),
 			IsOwner:     owner != "" && row.Username == owner,
 		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	sort.SliceStable(members, func(i, j int) bool {
 		if members[i].IsOwner != members[j].IsOwner {
@@ -538,10 +556,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func sqlQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func paginate(list []Contact, limit int, offset int) []Contact {

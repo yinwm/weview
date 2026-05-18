@@ -1,15 +1,14 @@
 package media
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
+	"database/sql"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
 
 type resourceMediaFile struct {
@@ -59,24 +58,24 @@ func queryHardlinkMedia(dbPath string, dataDir string, mediaType string, keys []
 		return nil
 	}
 	accountBase := filepath.Dir(dataDir)
-	condition := resourceKeyCondition(keys, "f.md5", "f.file_name")
+	condition, args := resourceKeyCondition(keys, "f.md5", "f.file_name")
 	var out []resourceMediaFile
 	for _, table := range []string{tablePrefix + "_hardlink_info_v3", tablePrefix + "_hardlink_info_v4"} {
 		query := fmt.Sprintf(`
 SELECT
-  COALESCE(f.md5, '') AS key,
-  COALESCE(f.file_name, '') AS name,
-  COALESCE(f.file_size, 0) AS size,
-  COALESCE(f.modify_time, 0) AS modify_time,
-  COALESCE(d1.username, '') AS dir1,
-  COALESCE(d2.username, '') AS dir2,
-  '' AS relative_path
+  COALESCE(f.md5, ''),
+  COALESCE(f.file_name, ''),
+  COALESCE(f.file_size, 0),
+  COALESCE(f.modify_time, 0),
+  COALESCE(d1.username, ''),
+  COALESCE(d2.username, ''),
+  ''
 FROM %s f
 LEFT JOIN dir2id d1 ON d1.rowid = f.dir1
 LEFT JOIN dir2id d2 ON d2.rowid = f.dir2
 WHERE %s;
-`, table, condition)
-		rows := queryResourceRows(dbPath, query)
+`, sqlitedb.QuoteIdent(table), condition)
+		rows := queryResourceRows(dbPath, query, args...)
 		for _, row := range rows {
 			path := hardlinkPath(accountBase, mediaType, row)
 			if path == "" {
@@ -96,21 +95,21 @@ WHERE %s;
 
 func queryHlinkMedia(dbPath string, dataDir string, keys []string) []resourceMediaFile {
 	accountBase := filepath.Dir(dataDir)
-	condition := resourceKeyCondition(keys, "r.mediaMd5", "d.fileName")
+	condition, args := resourceKeyCondition(keys, "r.mediaMd5", "d.fileName")
 	query := fmt.Sprintf(`
 SELECT
-  COALESCE(r.mediaMd5, '') AS key,
-  COALESCE(d.fileName, '') AS name,
-  COALESCE(r.mediaSize, 0) AS size,
-  COALESCE(r.modifyTime, 0) AS modify_time,
-  '' AS dir1,
-  '' AS dir2,
-  COALESCE(d.relativePath, '') AS relative_path
+  COALESCE(r.mediaMd5, ''),
+  COALESCE(d.fileName, ''),
+  COALESCE(r.mediaSize, 0),
+  COALESCE(r.modifyTime, 0),
+  '',
+  '',
+  COALESCE(d.relativePath, '')
 FROM HlinkMediaRecord r
 JOIN HlinkMediaDetail d ON r.inodeNumber = d.inodeNumber
 WHERE %s;
 `, condition)
-	rows := queryResourceRows(dbPath, query)
+	rows := queryResourceRows(dbPath, query, args...)
 	out := make([]resourceMediaFile, 0, len(rows))
 	for _, row := range rows {
 		if row.RelativePath == "" || row.Name == "" {
@@ -127,17 +126,29 @@ WHERE %s;
 	return out
 }
 
-func queryResourceRows(dbPath string, query string) []resourceMediaRow {
-	cmd := exec.Command("sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), query)
-	out, err := cmd.CombinedOutput()
-	if err != nil || len(bytes.TrimSpace(out)) == 0 {
+func queryResourceRows(dbPath string, query string, args ...any) []resourceMediaRow {
+	db, err := sqlitedb.OpenReadOnly(context.Background(), dbPath)
+	if err != nil {
 		return nil
 	}
-	var rows []resourceMediaRow
-	if err := json.Unmarshal(out, &rows); err != nil {
+	defer db.Close()
+	rows, err := db.QueryContext(context.Background(), query, args...)
+	if err != nil {
 		return nil
 	}
-	return rows
+	defer rows.Close()
+	out := []resourceMediaRow{}
+	for rows.Next() {
+		var row resourceMediaRow
+		if err := rows.Scan(&row.Key, &row.Name, &row.Size, &row.ModifyTime, &row.Dir1, &row.Dir2, &row.RelativePath); err != nil {
+			return nil
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil && err != sql.ErrNoRows {
+		return nil
+	}
+	return out
 }
 
 func hardlinkPath(accountBase string, mediaType string, row resourceMediaRow) string {
@@ -165,14 +176,16 @@ func hardlinkPath(accountBase string, mediaType string, row resourceMediaRow) st
 	}
 }
 
-func resourceKeyCondition(keys []string, keyColumn string, nameColumn string) string {
+func resourceKeyCondition(keys []string, keyColumn string, nameColumn string) (string, []any) {
 	parts := make([]string, 0, len(keys)*2)
+	args := make([]any, 0, len(keys)*2)
 	for _, key := range keys {
-		quoted := sqlLiteral(key)
-		parts = append(parts, keyColumn+" = "+quoted)
-		parts = append(parts, nameColumn+" LIKE "+quoted+" || '%'")
+		parts = append(parts, keyColumn+" = ?")
+		args = append(args, key)
+		parts = append(parts, nameColumn+" LIKE ? || '%'")
+		args = append(args, key)
 	}
-	return strings.Join(parts, " OR ")
+	return strings.Join(parts, " OR "), args
 }
 
 func cleanMediaKeys(keys []string) []string {
@@ -195,10 +208,6 @@ func cleanMediaKeys(keys []string) []string {
 		}
 	}
 	return out
-}
-
-func sqlLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func dedupeResourceFiles(files []resourceMediaFile) []resourceMediaFile {

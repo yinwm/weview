@@ -9,7 +9,6 @@ import (
 	"image/color"
 	"image/png"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +16,8 @@ import (
 	zstdpkg "github.com/klauspost/compress/zstd"
 
 	"wxview/internal/media"
+	"wxview/internal/sqlitedb"
+	"wxview/internal/sqlitedb/sqlitetest"
 )
 
 func TestListMergesShardsSortsAscendingAndPaginates(t *testing.T) {
@@ -511,9 +512,8 @@ type messageRow struct {
 
 func createMessageDB(t *testing.T, path string, table string, rows []messageRow) {
 	t.Helper()
-	requireSQLite3(t)
-	sql := fmt.Sprintf(`
-CREATE TABLE [%s] (
+	db := sqlitetest.CreateDB(t, path, fmt.Sprintf(`
+CREATE TABLE %s (
   local_id INTEGER PRIMARY KEY,
   server_id INTEGER,
   local_type INTEGER,
@@ -526,34 +526,31 @@ CREATE TABLE [%s] (
 );
 CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);
 INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (2, 'self_user', 0);
-`, table)
+`, sqlitedb.QuoteIdent(table)))
+	defer db.Close()
 	for _, row := range rows {
 		localType := row.LocalType
 		if localType == 0 {
 			localType = 1
 		}
 		realSenderID := row.RealSenderID
-		contentSQL := sqlQuote(row.Content)
+		content := []byte(row.Content)
 		if row.ContentBlob != nil {
-			contentSQL = "X'" + hex.EncodeToString(row.ContentBlob) + "'"
+			content = row.ContentBlob
 		}
 		if row.SenderName != "" && realSenderID != 0 && realSenderID != 2 {
-			sql += fmt.Sprintf("INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (%d, %s, 0);\n", realSenderID, sqlQuote(row.SenderName))
+			sqlitetest.Exec(t, db, "INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (?, ?, 0);", realSenderID, row.SenderName)
 		}
-		sql += fmt.Sprintf(
-			"INSERT INTO [%s] (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (%d, 0, %d, %d, %d, %d, %d, %s, 0);\n",
-			table,
+		sqlitetest.Exec(t, db,
+			fmt.Sprintf("INSERT INTO %s (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (?, 0, ?, ?, ?, ?, ?, ?, 0);", sqlitedb.QuoteIdent(table)),
 			row.LocalID,
 			localType,
 			row.SortSeq,
 			realSenderID,
 			row.CreateTime,
 			row.Status,
-			contentSQL,
+			content,
 		)
-	}
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create message db: %v: %s", err, out)
 	}
 }
 
@@ -565,18 +562,6 @@ func zstdCompress(t *testing.T, text string) []byte {
 	}
 	defer encoder.Close()
 	return encoder.EncodeAll([]byte(text), nil)
-}
-
-func sqlQuote(s string) string {
-	out := "'"
-	for _, r := range s {
-		if r == '\'' {
-			out += "''"
-			continue
-		}
-		out += string(r)
-	}
-	return out + "'"
 }
 
 func md5HexForTest(value string) string {
@@ -599,13 +584,6 @@ func writePNGForTest(t *testing.T, path string, width int, height int) {
 	defer file.Close()
 	if err := png.Encode(file, img); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func requireSQLite3(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for message query tests")
 	}
 }
 

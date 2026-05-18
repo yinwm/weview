@@ -2,14 +2,14 @@ package timeline
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"wxview/internal/messages"
+	"wxview/internal/sqlitedb"
+	"wxview/internal/sqlitedb/sqlitetest"
 )
 
 func TestListMergesChatsAndPagesWithCursor(t *testing.T) {
@@ -111,11 +111,8 @@ type timelineMessageRow struct {
 
 func createTimelineMessageDB(t *testing.T, path string, table string, rows []timelineMessageRow) {
 	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for timeline query tests")
-	}
-	sql := fmt.Sprintf(`
-CREATE TABLE [%s] (
+	db := sqlitetest.CreateDB(t, path, fmt.Sprintf(`
+CREATE TABLE %s (
   local_id INTEGER PRIMARY KEY,
   server_id INTEGER,
   local_type INTEGER,
@@ -128,18 +125,15 @@ CREATE TABLE [%s] (
 );
 CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);
 INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (2, 'self_user', 0);
-`, table)
+`, sqlitedb.QuoteIdent(table)))
+	defer db.Close()
 	for _, row := range rows {
-		sql += fmt.Sprintf(
-			"INSERT INTO [%s] (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (%d, 0, 1, %d, 0, %d, 4, X'%s', 0);\n",
-			table,
+		sqlitetest.Exec(t, db,
+			fmt.Sprintf("INSERT INTO %s (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (?, 0, 1, ?, 0, ?, 4, ?, 0);", sqlitedb.QuoteIdent(table)),
 			row.LocalID,
 			row.SortSeq,
 			row.CreateTime,
-			hex.EncodeToString([]byte(row.Content)),
+			[]byte(row.Content),
 		)
-	}
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create timeline message db: %v: %s", err, out)
 	}
 }

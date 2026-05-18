@@ -2,23 +2,23 @@ package msgindex
 
 import (
 	"context"
-	"encoding/hex"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"wxview/internal/messages"
+	"wxview/internal/sqlitedb"
+	"wxview/internal/sqlitedb/sqlitetest"
 	"wxview/internal/timeline"
 )
 
 func TestBuildStatusAndMessageRefs(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -99,7 +99,6 @@ func TestBuildStatusAndMessageRefs(t *testing.T) {
 }
 
 func TestStatusLagPolicyAndSchemaMismatch(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -149,9 +148,7 @@ func TestStatusLagPolicyAndSchemaMismatch(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", indexPath, "UPDATE meta SET value='999' WHERE key='schema_version';").CombinedOutput(); err != nil {
-		t.Fatalf("update schema version: %v: %s", err, out)
-	}
+	execIndexTestSQL(t, ctx, indexPath, "UPDATE meta SET value='999' WHERE key='schema_version';")
 	status, err = StatusFor(ctx, indexPath, []string{db})
 	if err != nil {
 		t.Fatal(err)
@@ -162,7 +159,6 @@ func TestStatusLagPolicyAndSchemaMismatch(t *testing.T) {
 }
 
 func TestRefreshCatchesUpIncrementally(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -219,7 +215,6 @@ func TestRefreshCatchesUpIncrementally(t *testing.T) {
 }
 
 func TestRefreshResumesInterruptedIndexFromWatermark(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -263,7 +258,6 @@ func TestRefreshResumesInterruptedIndexFromWatermark(t *testing.T) {
 }
 
 func TestUseForQueryAllowsHistoricalRangeWhenIndexIsStale(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -328,7 +322,8 @@ func TestStatusReportsBuildingProgress(t *testing.T) {
 		CurrentTable:    messages.TableName("alice"),
 		TotalSources:    2,
 		TotalTables:     4,
-		CompletedTables: 1,
+		CheckedTables:   1,
+		CoveredTables:   1,
 		TotalRows:       100,
 		IndexedRows:     25,
 		Percent:         25,
@@ -354,7 +349,6 @@ func TestStatusReportsBuildingProgress(t *testing.T) {
 }
 
 func TestStatusMergesProgressWithIndexStatsAndInterruptedJobState(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -444,7 +438,6 @@ func TestCleanIndexTmpRemovesOrphansAndKeepsActiveTemp(t *testing.T) {
 }
 
 func TestTimelineRefsCursorOrder(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -501,7 +494,6 @@ func TestTimelineRefsCursorOrder(t *testing.T) {
 }
 
 func TestCoversChatsDetectsMissingIndexedChat(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -537,7 +529,6 @@ func TestCoversChatsDetectsMissingIndexedChat(t *testing.T) {
 }
 
 func TestSearchRefsFTSAndUnsupportedFallbackSignal(t *testing.T) {
-	requireSQLite3(t)
 	requireFTS5(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -591,12 +582,12 @@ type indexMessageRow struct {
 
 func createIndexMessageDB(t *testing.T, path string, tables map[string][]indexMessageRow) {
 	t.Helper()
-	var sql strings.Builder
-	sql.WriteString("CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);\n")
-	sql.WriteString("INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (2, 'self_user', 0);\n")
+	db := sqlitetest.CreateDB(t, path, "CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);")
+	defer db.Close()
+	sqlitetest.Exec(t, db, "INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (?, ?, 0);", 2, "self_user")
 	for table, rows := range tables {
-		sql.WriteString(fmt.Sprintf(`
-CREATE TABLE [%s] (
+		sqlitetest.Exec(t, db, fmt.Sprintf(`
+CREATE TABLE %s (
   local_id INTEGER PRIMARY KEY,
   server_id INTEGER,
   local_type INTEGER,
@@ -607,70 +598,65 @@ CREATE TABLE [%s] (
   message_content BLOB,
   WCDB_CT_message_content INTEGER
 );
-`, table))
+`, sqlitedb.QuoteIdent(table)))
 		for _, row := range rows {
-			localType := row.LocalType
-			if localType == 0 {
-				localType = 1
-			}
 			if row.SenderName != "" && row.RealSenderID != 0 && row.RealSenderID != 2 {
-				sql.WriteString(fmt.Sprintf("INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (%d, %s, 0);\n", row.RealSenderID, sqlQuote(row.SenderName)))
+				sqlitetest.Exec(t, db, "INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (?, ?, 0);", row.RealSenderID, row.SenderName)
 			}
-			sql.WriteString(fmt.Sprintf(
-				"INSERT INTO [%s] (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (%d, 0, %d, %d, %d, %d, %d, X'%s', 0);\n",
-				table,
-				row.LocalID,
-				localType,
-				row.SortSeq,
-				row.RealSenderID,
-				row.CreateTime,
-				row.Status,
-				hex.EncodeToString([]byte(row.Content)),
-			))
+			insertIndexMessageRowDB(t, db, table, row)
 		}
-	}
-	if out, err := exec.Command("sqlite3", path, sql.String()).CombinedOutput(); err != nil {
-		t.Fatalf("create message db: %v: %s", err, out)
 	}
 }
 
 func insertIndexMessageRow(t *testing.T, path string, table string, row indexMessageRow) {
 	t.Helper()
+	db, err := sqlitedb.OpenReadWrite(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	insertIndexMessageRowDB(t, db, table, row)
+}
+
+func insertIndexMessageRowDB(t *testing.T, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, table string, row indexMessageRow) {
+	t.Helper()
 	localType := row.LocalType
 	if localType == 0 {
 		localType = 1
 	}
-	sql := fmt.Sprintf(
-		"INSERT INTO [%s] (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (%d, 0, %d, %d, %d, %d, %d, X'%s', 0);",
-		table,
+	query := fmt.Sprintf(
+		"INSERT INTO %s (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (?, 0, ?, ?, ?, ?, ?, ?, 0);",
+		sqlitedb.QuoteIdent(table),
+	)
+	sqlitetest.Exec(t, db, query,
 		row.LocalID,
 		localType,
 		row.SortSeq,
 		row.RealSenderID,
 		row.CreateTime,
 		row.Status,
-		hex.EncodeToString([]byte(row.Content)),
+		[]byte(row.Content),
 	)
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
-		t.Fatalf("insert message row: %v: %s", err, out)
-	}
-}
-
-func requireSQLite3(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 not available")
-	}
 }
 
 func requireFTS5(t *testing.T) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fts.db")
-	if out, err := exec.Command("sqlite3", path, "CREATE VIRTUAL TABLE message_fts USING fts5(search_text);").CombinedOutput(); err != nil {
-		t.Skipf("sqlite3 FTS5 not available: %v: %s", err, out)
+	db := sqlitetest.CreateDB(t, path, "")
+	defer db.Close()
+	if _, err := db.ExecContext(context.Background(), "CREATE VIRTUAL TABLE message_fts USING fts5(search_text);"); err != nil {
+		t.Fatalf("modernc sqlite FTS5 unavailable: %v", err)
 	}
 }
 
-func sqlQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+func execIndexTestSQL(t *testing.T, ctx context.Context, path string, query string, args ...any) {
+	t.Helper()
+	db, err := sqlitedb.OpenReadWrite(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	sqlitetest.Exec(t, db, query, args...)
 }

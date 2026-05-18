@@ -3,12 +3,13 @@ package articles
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"wxview/internal/messages"
+	"wxview/internal/sqlitedb"
+	"wxview/internal/sqlitedb/sqlitetest"
 )
 
 func TestAccountsFiltersOfficialAccounts(t *testing.T) {
@@ -99,7 +100,6 @@ type articleMessageRow struct {
 
 func createArticleContactDB(t *testing.T, path string, inserts string) {
 	t.Helper()
-	requireSQLite3(t)
 	sql := `
 CREATE TABLE contact (
   username TEXT,
@@ -111,16 +111,14 @@ CREATE TABLE contact (
   verify_flag INTEGER
 );
 ` + inserts
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create contact db: %v: %s", err, out)
-	}
+	db := sqlitetest.CreateDB(t, path, sql)
+	db.Close()
 }
 
 func createArticleMessageDB(t *testing.T, path string, table string, rows []articleMessageRow) {
 	t.Helper()
-	requireSQLite3(t)
-	sql := fmt.Sprintf(`
-CREATE TABLE [%s] (
+	db := sqlitetest.CreateDB(t, path, fmt.Sprintf(`
+CREATE TABLE %s (
   local_id INTEGER PRIMARY KEY,
   server_id INTEGER,
   local_type INTEGER,
@@ -133,30 +131,16 @@ CREATE TABLE [%s] (
 );
 CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);
 INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (2, 'self_user', 0);
-`, table)
+`, sqlitedb.QuoteIdent(table)))
+	defer db.Close()
 	for _, row := range rows {
-		sql += fmt.Sprintf(
-			"INSERT INTO [%s] (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (%d, 0, %d, %d, 0, %d, 0, %s, 0);\n",
-			table,
+		sqlitetest.Exec(t, db,
+			fmt.Sprintf("INSERT INTO %s (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, WCDB_CT_message_content) VALUES (?, 0, ?, ?, 0, ?, 0, ?, 0);", sqlitedb.QuoteIdent(table)),
 			row.LocalID,
 			row.LocalType,
 			row.SortSeq,
 			row.CreateTime,
-			sqlQuote(row.Content),
+			[]byte(row.Content),
 		)
-	}
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create message db: %v: %s", err, out)
-	}
-}
-
-func sqlQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
-func requireSQLite3(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for article query tests")
 	}
 }

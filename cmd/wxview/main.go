@@ -3195,7 +3195,7 @@ var articleFields = []string{"id", "account_username", "account_display_name", "
 var snsPostFields = []string{"id", "author_username", "time", "timestamp", "content", "location", "media_count"}
 var snsNotificationFields = []string{"id", "type", "from_username", "from_nick_name", "content", "feed_id", "feed_author_username", "feed_preview", "time", "timestamp"}
 var cacheStatusFields = []string{"group", "account", "db_rel_path", "status", "key_status", "source_size", "cache_size", "source_mtime", "cache_mtime", "refreshed_at", "reason"}
-var indexStatusFields = []string{"status", "query_mode", "schema_version", "source_db_count", "indexed_rows", "source_rows", "covered_chats", "built_at", "refreshed_at", "job_state", "lag_seconds", "lag_policy", "reason", "path", "progress_percent", "progress_rows", "progress_total_rows", "progress_tables", "progress_total_tables", "progress_current", "progress_updated_at"}
+var indexStatusFields = []string{"status", "query_mode", "schema_version", "source_db_count", "indexed_rows", "source_rows", "covered_chats", "built_at", "refreshed_at", "job_state", "lag_seconds", "lag_policy", "reason", "path", "progress_percent", "progress_rows", "progress_total_rows", "checked_tables", "covered_tables", "progress_total_tables", "progress_current", "progress_updated_at"}
 var indexBuildFields = append(append([]string{}, indexStatusFields...), "duration_ms")
 var cleanTmpFields = []string{"path", "removed", "removed_bytes", "kept"}
 
@@ -3803,7 +3803,8 @@ func indexStatusValues(status msgindex.Status) []string {
 		fmt.Sprintf("%.2f", status.ProgressPercent),
 		strconv.FormatInt(status.ProgressRows, 10),
 		strconv.FormatInt(status.ProgressTotalRows, 10),
-		strconv.Itoa(status.ProgressTables),
+		strconv.Itoa(status.CheckedTables),
+		strconv.Itoa(status.CoveredTables),
 		strconv.Itoa(status.ProgressTotalTables),
 		status.ProgressCurrent,
 		status.ProgressUpdatedAt,

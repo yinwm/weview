@@ -233,9 +233,9 @@ product goal.
 
 ## SQLite and Decryption Notes
 
-- The Go code intentionally avoids third-party Go dependencies for now.
-- SQLite cache validation, contact querying, and message querying use the
-  system `sqlite3` binary.
+- SQLite cache validation, cache querying, and derived index writes use
+  `database/sql` with the CGO-free `modernc.org/sqlite` driver. Normal wxview
+  usage does not require an external SQLite command-line tool.
 - Open decrypted cache DBs with an immutable read-only URI:
   `file://...?mode=ro&immutable=1`
   This avoids SQLite `unable to open database file (14)` issues with read-only

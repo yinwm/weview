@@ -1,19 +1,16 @@
 package sessions
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 	"time"
 
 	"wxview/internal/contacts"
 	"wxview/internal/messages"
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
 
 type Session struct {
@@ -145,14 +142,13 @@ func ApplyQueryOptions(list []Session, opts QueryOptions) []Session {
 }
 
 type queryRow struct {
-	Username              string `json:"username"`
-	UnreadCount           int64  `json:"unread_count"`
-	SummaryHex            string `json:"summary_hex"`
+	Username              string
+	UnreadCount           int64
 	Summary               []byte
-	LastTimestamp         int64  `json:"last_timestamp"`
-	LastMsgType           int64  `json:"last_msg_type"`
-	LastSender            string `json:"last_msg_sender"`
-	LastSenderDisplayName string `json:"last_sender_display_name"`
+	LastTimestamp         int64
+	LastMsgType           int64
+	LastSender            string
+	LastSenderDisplayName string
 }
 
 func querySessionTable(ctx context.Context, dbPath string, unreadOnly bool) ([]queryRow, error) {
@@ -162,13 +158,13 @@ func querySessionTable(ctx context.Context, dbPath string, unreadOnly bool) ([]q
 	}
 	query := fmt.Sprintf(`
 SELECT
-  COALESCE(username, '') AS username,
-  COALESCE(unread_count, 0) AS unread_count,
-  hex(COALESCE(summary, X'')) AS summary_hex,
-  COALESCE(last_timestamp, 0) AS last_timestamp,
-  COALESCE(last_msg_type, 0) AS last_msg_type,
-  COALESCE(last_msg_sender, '') AS last_msg_sender,
-  COALESCE(last_sender_display_name, '') AS last_sender_display_name
+  COALESCE(username, ''),
+  COALESCE(unread_count, 0),
+  COALESCE(summary, X''),
+  COALESCE(last_timestamp, 0),
+  COALESCE(last_msg_type, 0),
+  COALESCE(last_msg_sender, ''),
+  COALESCE(last_sender_display_name, '')
 FROM SessionTable
 %s
 ORDER BY last_timestamp DESC;
@@ -183,13 +179,13 @@ func querySessionAbstract(ctx context.Context, dbPath string, unreadOnly bool) (
 	}
 	query := fmt.Sprintf(`
 SELECT
-  COALESCE(m_nsUserName, '') AS username,
-  COALESCE(m_uUnReadCount, 0) AS unread_count,
-  '' AS summary_hex,
-  COALESCE(m_uLastTime, 0) AS last_timestamp,
-  0 AS last_msg_type,
-  '' AS last_msg_sender,
-  '' AS last_sender_display_name
+  COALESCE(m_nsUserName, ''),
+  COALESCE(m_uUnReadCount, 0),
+  X'',
+  COALESCE(m_uLastTime, 0),
+  0,
+  '',
+  ''
 FROM SessionAbstract
 %s
 ORDER BY m_uLastTime DESC;
@@ -198,47 +194,42 @@ ORDER BY m_uLastTime DESC;
 }
 
 func queryRows(ctx context.Context, dbPath string, query string) ([]queryRow, error) {
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), query)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("query session cache: %v: %s", err, bytes.TrimSpace(out))
+		return nil, err
 	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, nil
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query session cache: %w", err)
 	}
-	var rows []queryRow
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil, fmt.Errorf("parse sqlite json: %w", err)
-	}
-	for i := range rows {
-		if rows[i].SummaryHex == "" {
-			continue
+	defer rows.Close()
+	out := []queryRow{}
+	for rows.Next() {
+		var row queryRow
+		if err := rows.Scan(
+			&row.Username,
+			&row.UnreadCount,
+			&row.Summary,
+			&row.LastTimestamp,
+			&row.LastMsgType,
+			&row.LastSender,
+			&row.LastSenderDisplayName,
+		); err != nil {
+			return nil, err
 		}
-		raw, err := hexBytes(rows[i].SummaryHex)
-		if err == nil {
-			rows[i].Summary = raw
-		}
+		out = append(out, row)
 	}
-	return rows, nil
+	return out, rows.Err()
 }
 
 func tableExists(ctx context.Context, dbPath string, table string) (bool, error) {
-	query := fmt.Sprintf("SELECT name FROM sqlite_master WHERE type='table' AND name=%s LIMIT 1;", sqlQuote(table))
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), query)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, dbPath)
 	if err != nil {
-		return false, fmt.Errorf("query session table %s: %v: %s", table, err, bytes.TrimSpace(out))
+		return false, err
 	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return false, nil
-	}
-	var rows []struct {
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return false, fmt.Errorf("parse sqlite json: %w", err)
-	}
-	return len(rows) > 0, nil
+	defer db.Close()
+	return sqlitedb.TableExists(ctx, db, table)
 }
 
 func filter(list []Session, opts QueryOptions) []Session {
@@ -320,40 +311,4 @@ func defaultString(value string, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func sqlQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-}
-
-func hexBytes(value string) ([]byte, error) {
-	if len(value)%2 != 0 {
-		return nil, fmt.Errorf("invalid hex length")
-	}
-	out := make([]byte, len(value)/2)
-	for i := 0; i < len(out); i++ {
-		hi, ok := fromHex(value[i*2])
-		if !ok {
-			return nil, fmt.Errorf("invalid hex")
-		}
-		lo, ok := fromHex(value[i*2+1])
-		if !ok {
-			return nil, fmt.Errorf("invalid hex")
-		}
-		out[i] = hi<<4 | lo
-	}
-	return out, nil
-}
-
-func fromHex(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	default:
-		return 0, false
-	}
 }

@@ -1,18 +1,15 @@
 package sns
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 	"time"
 
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
 
 type Post struct {
@@ -113,14 +110,17 @@ func (s Service) Notifications(ctx context.Context, opts QueryOptions) ([]Notifi
 		return nil, fmt.Errorf("limit and offset must be >= 0")
 	}
 	clauses := []string{}
+	args := []any{}
 	if !opts.IncludeRead {
 		clauses = append(clauses, "COALESCE(is_unread, 0) = 1")
 	}
 	if opts.HasStart {
-		clauses = append(clauses, fmt.Sprintf("create_time >= %d", opts.Start))
+		clauses = append(clauses, "create_time >= ?")
+		args = append(args, opts.Start)
 	}
 	if opts.HasEnd {
-		clauses = append(clauses, fmt.Sprintf("create_time <= %d", opts.End))
+		clauses = append(clauses, "create_time <= ?")
+		args = append(args, opts.End)
 	}
 	whereSQL := ""
 	if len(clauses) > 0 {
@@ -132,29 +132,39 @@ func (s Service) Notifications(ctx context.Context, opts QueryOptions) ([]Notifi
 	} else if opts.Offset > 0 {
 		limitSQL = fmt.Sprintf("LIMIT -1 OFFSET %d", opts.Offset)
 	}
-	sql := fmt.Sprintf(`
+	query := fmt.Sprintf(`
 SELECT
-  COALESCE(local_id, 0) AS local_id,
-  COALESCE(create_time, 0) AS create_time,
-  COALESCE(feed_id, 0) AS feed_id,
-  COALESCE(from_username, '') AS from_username,
-  COALESCE(from_nickname, '') AS from_nickname,
-  COALESCE(content, '') AS content
+  COALESCE(local_id, 0),
+  COALESCE(create_time, 0),
+  COALESCE(feed_id, 0),
+  COALESCE(from_username, ''),
+  COALESCE(from_nickname, ''),
+  COALESCE(content, '')
 FROM SnsMessage_tmp3
 %s
 ORDER BY create_time DESC
 %s;
 `, whereSQL, limitSQL)
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), sql)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
-		return nil, fmt.Errorf("query sns notifications: %v: %s", err, bytes.TrimSpace(out))
+		return nil, err
 	}
-	var rows []notificationRow
-	if len(bytes.TrimSpace(out)) > 0 {
-		if err := json.Unmarshal(out, &rows); err != nil {
-			return nil, fmt.Errorf("parse sqlite json: %w", err)
+	defer db.Close()
+	sqlRows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query sns notifications: %w", err)
+	}
+	defer sqlRows.Close()
+	rows := []notificationRow{}
+	for sqlRows.Next() {
+		var row notificationRow
+		if err := sqlRows.Scan(&row.ID, &row.CreateTime, &row.FeedID, &row.FromUsername, &row.FromNickName, &row.Content); err != nil {
+			return nil, err
 		}
+		rows = append(rows, row)
+	}
+	if err := sqlRows.Err(); err != nil {
+		return nil, err
 	}
 	feeds := s.feedPreviewMap(ctx, feedIDs(rows))
 	items := make([]Notification, 0, len(rows))
@@ -202,26 +212,33 @@ func (s Service) queryTimeline(ctx context.Context, opts QueryOptions) ([]timeli
 	if opts.Limit < 0 || opts.Offset < 0 {
 		return nil, fmt.Errorf("limit and offset must be >= 0")
 	}
-	sql := `
+	query := `
 SELECT
-  COALESCE(tid, 0) AS tid,
-  COALESCE(user_name, '') AS user_name,
-  COALESCE(content, '') AS content
+  COALESCE(tid, 0),
+  COALESCE(user_name, ''),
+  COALESCE(content, '')
 FROM SnsTimeLine
 ORDER BY tid DESC;
 `
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), sql)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
-		return nil, fmt.Errorf("query sns timeline: %v: %s", err, bytes.TrimSpace(out))
+		return nil, err
 	}
-	var rows []timelineRow
-	if len(bytes.TrimSpace(out)) > 0 {
-		if err := json.Unmarshal(out, &rows); err != nil {
-			return nil, fmt.Errorf("parse sqlite json: %w", err)
+	defer db.Close()
+	sqlRows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query sns timeline: %w", err)
+	}
+	defer sqlRows.Close()
+	rows := []timelineRow{}
+	for sqlRows.Next() {
+		var row timelineRow
+		if err := sqlRows.Scan(&row.ID, &row.AuthorUsername, &row.Content); err != nil {
+			return nil, err
 		}
+		rows = append(rows, row)
 	}
-	return rows, nil
+	return rows, sqlRows.Err()
 }
 
 func (s Service) ensureCache() error {
@@ -331,26 +348,35 @@ func (s Service) feedPreviewMap(ctx context.Context, ids []int64) map[int64]prev
 	if len(ids) == 0 {
 		return nil
 	}
-	parts := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
 	for _, id := range ids {
-		parts = append(parts, fmt.Sprintf("%d", id))
+		args = append(args, id)
 	}
-	sql := fmt.Sprintf(`
+	query := fmt.Sprintf(`
 SELECT
-  COALESCE(tid, 0) AS tid,
-  COALESCE(user_name, '') AS user_name,
-  COALESCE(content, '') AS content
+  COALESCE(tid, 0),
+  COALESCE(user_name, ''),
+  COALESCE(content, '')
 FROM SnsTimeLine
 WHERE tid IN (%s);
-`, strings.Join(parts, ","))
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), sql)
-	out, err := cmd.CombinedOutput()
+`, sqlitedb.Placeholders(len(ids)))
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
 		return nil
 	}
-	var rows []timelineRow
-	if err := json.Unmarshal(out, &rows); err != nil {
+	defer db.Close()
+	sqlRows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
 		return nil
+	}
+	defer sqlRows.Close()
+	rows := []timelineRow{}
+	for sqlRows.Next() {
+		var row timelineRow
+		if err := sqlRows.Scan(&row.ID, &row.AuthorUsername, &row.Content); err != nil {
+			return nil
+		}
+		rows = append(rows, row)
 	}
 	outMap := make(map[int64]preview, len(rows))
 	for _, row := range rows {

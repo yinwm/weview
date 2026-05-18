@@ -2,18 +2,11 @@ package media
 
 import (
 	"bytes"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
+	"context"
 	"os"
-	"os/exec"
 
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
-
-type avatarRow struct {
-	ImageHex string `json:"image_hex"`
-}
 
 func ResolveAvatar(headImageDB string, username string, cacheDir string) Info {
 	if headImageDB == "" || username == "" {
@@ -22,18 +15,17 @@ func ResolveAvatar(headImageDB string, username string, cacheDir string) Info {
 	if _, err := os.Stat(headImageDB); err != nil {
 		return notFound("avatar", "head_image cache not found")
 	}
-	query := fmt.Sprintf("SELECT hex(image_buffer) AS image_hex FROM head_image WHERE username = %s AND length(image_buffer) > 0 LIMIT 1;", sqlLiteral(username))
-	cmd := exec.Command("sqlite3", "-json", sqlitecli.ImmutableURI(headImageDB), query)
-	out, err := cmd.CombinedOutput()
-	if err != nil || len(bytes.TrimSpace(out)) == 0 {
+	db, err := sqlitedb.OpenReadOnly(context.Background(), headImageDB)
+	if err != nil {
 		return notFound("avatar", "local avatar not found in head_image.db")
 	}
-	var rows []avatarRow
-	if err := json.Unmarshal(out, &rows); err != nil || len(rows) == 0 {
+	defer db.Close()
+	var data []byte
+	err = db.QueryRowContext(context.Background(), "SELECT image_buffer FROM head_image WHERE username = ? AND length(image_buffer) > 0 LIMIT 1;", username).Scan(&data)
+	if err != nil {
 		return notFound("avatar", "local avatar not found in head_image.db")
 	}
-	data, err := hex.DecodeString(rows[0].ImageHex)
-	if err != nil || len(data) == 0 {
+	if len(data) == 0 {
 		return notFound("avatar", "local avatar image buffer is empty")
 	}
 	resolver := Resolver{CacheDir: cacheDir}

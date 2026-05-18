@@ -3,10 +3,11 @@ package sns
 import (
 	"context"
 	"encoding/json"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"wxview/internal/sqlitedb/sqlitetest"
 )
 
 func TestFeedParsesTimelineMediaWithoutSecrets(t *testing.T) {
@@ -111,10 +112,6 @@ VALUES (2, 1710000200, 20, 'wxid_read', 'Read Friend', '', 0);
 
 func createSNSDB(t *testing.T, path string, sql string) {
 	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for sns query tests")
-	}
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create sns db: %v: %s", err, out)
-	}
+	db := sqlitetest.CreateDB(t, path, sql)
+	db.Close()
 }

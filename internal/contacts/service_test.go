@@ -3,15 +3,13 @@ package contacts
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"wxview/internal/sqlitedb/sqlitetest"
 )
 
 func TestListReturnsConfiguredContactFields(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for contact query tests")
-	}
 	db := filepath.Join(t.TempDir(), "contact.db")
 	sql := `
 CREATE TABLE contact (id INTEGER, username TEXT, local_type INTEGER, alias TEXT, remark TEXT, nick_name TEXT, big_head_url TEXT);
@@ -19,9 +17,7 @@ INSERT INTO contact VALUES (1, 'u1', 1, 'alias1', 'Remark 1', 'Nick 1', 'https:/
 INSERT INTO contact VALUES (3, '10000@chatroom', 1, '', '', 'Group 1', '');
 INSERT INTO contact VALUES (4, 'gh_x', 1, '', '', 'OA', '');
 `
-	if out, err := exec.Command("sqlite3", db, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create db: %v: %s", err, out)
-	}
+	createContactDB(t, db, sql)
 	got, err := NewService(db).List(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -58,9 +54,6 @@ INSERT INTO contact VALUES (4, 'gh_x', 1, '', '', 'OA', '');
 }
 
 func TestListClassifiesCurrentAccountAsOther(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for contact query tests")
-	}
 	dir := filepath.Join(t.TempDir(), "cache", "wxid_self_abcd", "contact")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -71,9 +64,7 @@ CREATE TABLE contact (id INTEGER, username TEXT, local_type INTEGER, alias TEXT,
 INSERT INTO contact VALUES (2, 'wxid_self', 1, 'me_alias', '', 'Me', '');
 INSERT INTO contact VALUES (3, 'wxid_friend', 1, '', '', 'Friend', '');
 `
-	if out, err := exec.Command("sqlite3", db, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create db: %v: %s", err, out)
-	}
+	createContactDB(t, db, sql)
 	got, err := NewService(db).List(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -91,9 +82,6 @@ INSERT INTO contact VALUES (3, 'wxid_friend', 1, '', '', 'Friend', '');
 }
 
 func TestDetailReturnsRichContactFields(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for contact query tests")
-	}
 	db := filepath.Join(t.TempDir(), "contact.db")
 	sql := `
 CREATE TABLE contact (
@@ -103,9 +91,7 @@ CREATE TABLE contact (
 );
 INSERT INTO contact VALUES (9, 'gh_news', 1, 'news_alias', 'News Remark', 'News Nick', 'small', 'big', 'desc text', 8);
 `
-	if out, err := exec.Command("sqlite3", db, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create db: %v: %s", err, out)
-	}
+	createContactDB(t, db, sql)
 	got, err := NewService(db).Detail(context.Background(), "gh_news")
 	if err != nil {
 		t.Fatal(err)
@@ -119,9 +105,6 @@ INSERT INTO contact VALUES (9, 'gh_news', 1, 'news_alias', 'News Remark', 'News 
 }
 
 func TestMembersReturnsOwnerFirst(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for contact query tests")
-	}
 	db := filepath.Join(t.TempDir(), "contact.db")
 	sql := `
 CREATE TABLE contact (
@@ -137,9 +120,7 @@ INSERT INTO chat_room VALUES (10, 'wxid_owner');
 INSERT INTO chatroom_member VALUES (10, 12);
 INSERT INTO chatroom_member VALUES (10, 11);
 `
-	if out, err := exec.Command("sqlite3", db, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create db: %v: %s", err, out)
-	}
+	createContactDB(t, db, sql)
 	got, err := NewService(db).Members(context.Background(), "room@chatroom")
 	if err != nil {
 		t.Fatal(err)
@@ -156,6 +137,12 @@ INSERT INTO chatroom_member VALUES (10, 11);
 	if got.Members[1].DisplayName != "Member Remark" {
 		t.Fatalf("member display name = %+v", got.Members[1])
 	}
+}
+
+func createContactDB(t *testing.T, path string, script string) {
+	t.Helper()
+	db := sqlitetest.CreateDB(t, path, script)
+	db.Close()
 }
 
 func TestFilterByKind(t *testing.T) {

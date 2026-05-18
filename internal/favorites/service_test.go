@@ -3,12 +3,13 @@ package favorites
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"wxview/internal/sqlitedb/sqlitetest"
 )
 
 func TestListExtractsArticleFavorite(t *testing.T) {
@@ -349,15 +350,6 @@ func TestListRejectsUnknownFavoriteType(t *testing.T) {
 
 func createFavoriteDB(t *testing.T, path string, sql string) {
 	t.Helper()
-	requireSQLite3(t)
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create favorite db: %v: %s", err, out)
-	}
-}
-
-func requireSQLite3(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for favorite query tests")
-	}
+	db := sqlitetest.CreateDB(t, path, sql)
+	db.Close()
 }

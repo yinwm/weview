@@ -1,17 +1,14 @@
 package articles
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 
 	"wxview/internal/messages"
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
 
 type Account struct {
@@ -84,16 +81,27 @@ WHERE username NOT LIKE '%@chatroom'
   AND (username LIKE 'gh_%' OR COALESCE(verify_flag, 0) != 0)
 ORDER BY COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), username) COLLATE NOCASE;
 `
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.ContactDB), sql)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, s.ContactDB)
 	if err != nil {
-		return nil, fmt.Errorf("query official accounts: %v: %s", err, bytes.TrimSpace(out))
+		return nil, err
 	}
-	var rows []Account
-	if len(bytes.TrimSpace(out)) > 0 {
-		if err := json.Unmarshal(out, &rows); err != nil {
-			return nil, fmt.Errorf("parse sqlite json: %w", err)
+	defer db.Close()
+	sqlRows, err := db.QueryContext(ctx, sql)
+	if err != nil {
+		return nil, fmt.Errorf("query official accounts: %w", err)
+	}
+	defer sqlRows.Close()
+	rows := []Account{}
+	for sqlRows.Next() {
+		var account Account
+		var verifyFlag int
+		if err := sqlRows.Scan(&account.Username, &account.Alias, &account.Remark, &account.NickName, &account.Description, &account.HeadURL, &verifyFlag); err != nil {
+			return nil, err
 		}
+		rows = append(rows, account)
+	}
+	if err := sqlRows.Err(); err != nil {
+		return nil, err
 	}
 	needle := strings.ToLower(strings.TrimSpace(query))
 	if needle == "" {

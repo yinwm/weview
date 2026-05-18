@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -18,7 +17,7 @@ import (
 	zstdpkg "github.com/klauspost/compress/zstd"
 
 	"wxview/internal/media"
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
 
 type Message struct {
@@ -338,81 +337,73 @@ func looksLikeXML(value string) bool {
 }
 
 func tableExists(ctx context.Context, dbPath string, tableName string) (bool, error) {
-	query := fmt.Sprintf("SELECT name FROM sqlite_master WHERE type='table' AND name='%s' LIMIT 1;", tableName)
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), query)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, dbPath)
 	if err != nil {
-		return false, fmt.Errorf("query message table in %s: %v: %s", dbPath, err, bytes.TrimSpace(out))
+		return false, err
 	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return false, nil
-	}
-	var rows []struct {
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return false, fmt.Errorf("parse sqlite json: %w", err)
-	}
-	return len(rows) > 0, nil
+	defer db.Close()
+	return sqlitedb.TableExists(ctx, db, tableName)
 }
 
 type queryRow struct {
-	LocalID      int64  `json:"local_id"`
-	LocalType    int64  `json:"local_type"`
-	SortSeq      int64  `json:"sort_seq"`
-	ServerID     int64  `json:"server_id"`
-	RealSenderID int64  `json:"real_sender_id"`
-	SenderName   string `json:"sender_name"`
-	Status       int64  `json:"status"`
-	CreateTime   int64  `json:"create_time"`
-	ContentHex   string `json:"content_hex"`
+	LocalID      int64
+	LocalType    int64
+	SortSeq      int64
+	ServerID     int64
+	RealSenderID int64
+	SenderName   string
+	Status       int64
+	CreateTime   int64
+	Content      []byte
 }
 
 func queryDB(ctx context.Context, dbPath string, tableName string, opts QueryOptions) ([]queryRow, error) {
 	whereSQL := ""
 	var clauses []string
+	args := []any{}
 	if opts.HasStart {
-		clauses = append(clauses, fmt.Sprintf("create_time >= %d", opts.Start))
+		clauses = append(clauses, "create_time >= ?")
+		args = append(args, opts.Start)
 	}
 	if opts.HasEnd {
-		clauses = append(clauses, fmt.Sprintf("create_time <= %d", opts.End))
+		clauses = append(clauses, "create_time <= ?")
+		args = append(args, opts.End)
 	}
 	if opts.HasAfterSeq {
-		clauses = append(clauses, fmt.Sprintf("sort_seq > %d", opts.AfterSeq))
+		clauses = append(clauses, "sort_seq > ?")
+		args = append(args, opts.AfterSeq)
 	}
 	if len(clauses) > 0 {
 		whereSQL = "WHERE " + strings.Join(clauses, " AND ")
 	}
+	query := messageRowsQuery(tableName, whereSQL) + " ORDER BY create_time ASC, sort_seq ASC, local_id ASC;"
+	db, err := sqlitedb.OpenReadOnly(ctx, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query messages in %s table=%s: %w", dbPath, tableName, err)
+	}
+	defer rows.Close()
+	return scanQueryRows(rows)
+}
 
-	query := fmt.Sprintf(`
+func messageRowsQuery(tableName string, whereSQL string) string {
+	return fmt.Sprintf(`
 SELECT
   local_id,
-  COALESCE(local_type, 0) AS local_type,
-  COALESCE(sort_seq, 0) AS sort_seq,
-  COALESCE(server_id, 0) AS server_id,
-  COALESCE(real_sender_id, 0) AS real_sender_id,
-  COALESCE((SELECT user_name FROM Name2Id WHERE rowid = COALESCE(real_sender_id, 0)), '') AS sender_name,
-  COALESCE(status, 0) AS status,
-  COALESCE(create_time, 0) AS create_time,
-  hex(COALESCE(message_content, X'')) AS content_hex
-FROM [%s]
-%s
-ORDER BY create_time ASC, sort_seq ASC, local_id ASC;
-`, tableName, whereSQL)
-
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), query)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("query messages in %s: %v: %s", dbPath, err, bytes.TrimSpace(out))
-	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, nil
-	}
-	var rows []queryRow
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil, fmt.Errorf("parse sqlite json: %w", err)
-	}
-	return rows, nil
+  COALESCE(local_type, 0),
+  COALESCE(sort_seq, 0),
+  COALESCE(server_id, 0),
+  COALESCE(real_sender_id, 0),
+  COALESCE((SELECT user_name FROM Name2Id WHERE rowid = COALESCE(real_sender_id, 0)), ''),
+  COALESCE(status, 0),
+  COALESCE(create_time, 0),
+  COALESCE(message_content, X'')
+FROM %s
+%s`, sqlitedb.QuoteIdent(tableName), whereSQL)
 }
 
 func queryRowsByLocalIDs(ctx context.Context, dbPath string, tableName string, localIDs []int64) ([]queryRow, error) {
@@ -421,38 +412,44 @@ func queryRowsByLocalIDs(ctx context.Context, dbPath string, tableName string, l
 	}
 	ids := append([]int64{}, localIDs...)
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	parts := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
 	for _, id := range ids {
-		parts = append(parts, strconv.FormatInt(id, 10))
+		args = append(args, id)
 	}
-	query := fmt.Sprintf(`
-SELECT
-  local_id,
-  COALESCE(local_type, 0) AS local_type,
-  COALESCE(sort_seq, 0) AS sort_seq,
-  COALESCE(server_id, 0) AS server_id,
-  COALESCE(real_sender_id, 0) AS real_sender_id,
-  COALESCE((SELECT user_name FROM Name2Id WHERE rowid = COALESCE(real_sender_id, 0)), '') AS sender_name,
-  COALESCE(status, 0) AS status,
-  COALESCE(create_time, 0) AS create_time,
-  hex(COALESCE(message_content, X'')) AS content_hex
-FROM [%s]
-WHERE local_id IN (%s);
-`, tableName, strings.Join(parts, ","))
-
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), query)
-	out, err := cmd.CombinedOutput()
+	query := messageRowsQuery(tableName, "WHERE local_id IN ("+sqlitedb.Placeholders(len(ids))+")") + ";"
+	db, err := sqlitedb.OpenReadOnly(ctx, dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("query indexed messages in %s: %v: %s", dbPath, err, bytes.TrimSpace(out))
+		return nil, err
 	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, nil
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query indexed messages in %s table=%s: %w", dbPath, tableName, err)
 	}
-	var rows []queryRow
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil, fmt.Errorf("parse sqlite json: %w", err)
+	defer rows.Close()
+	return scanQueryRows(rows)
+}
+
+func scanQueryRows(rows *sql.Rows) ([]queryRow, error) {
+	out := []queryRow{}
+	for rows.Next() {
+		var row queryRow
+		if err := rows.Scan(
+			&row.LocalID,
+			&row.LocalType,
+			&row.SortSeq,
+			&row.ServerID,
+			&row.RealSenderID,
+			&row.SenderName,
+			&row.Status,
+			&row.CreateTime,
+			&row.Content,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
 	}
-	return rows, nil
+	return out, rows.Err()
 }
 
 func refKey(sourceDB string, tableName string, localID int64) string {
@@ -460,7 +457,7 @@ func refKey(sourceDB string, tableName string, localID int64) string {
 }
 
 func normalizeRow(username string, tableName string, sourceDB string, includeSource bool, row queryRow) Message {
-	content, encoding := decodeContentHex(row.ContentHex)
+	content, encoding := DecodeContent(row.Content)
 	content = strings.ToValidUTF8(content, "")
 	rawContent := content
 	fromUsername, direction, isSelf, bodyContent := inferSender(username, row.Status, row.RealSenderID, row.SenderName, content)
@@ -668,17 +665,6 @@ var (
 
 func init() {
 	zstdDecoder, zstdDecoderErr = zstdpkg.NewReader(nil)
-}
-
-func decodeContentHex(contentHex string) (string, string) {
-	if contentHex == "" {
-		return "", "text"
-	}
-	raw, err := hex.DecodeString(contentHex)
-	if err != nil {
-		return "", "invalid_hex"
-	}
-	return DecodeContent(raw)
 }
 
 func DecodeContent(raw []byte) (string, string) {

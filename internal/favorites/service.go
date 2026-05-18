@@ -1,19 +1,16 @@
 package favorites
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
 
 type Item struct {
@@ -103,12 +100,15 @@ func (s Service) List(ctx context.Context, opts QueryOptions) ([]Item, error) {
 	}
 
 	clauses := []string{}
+	args := []any{}
 	if hasType {
-		clauses = append(clauses, fmt.Sprintf("type = %d", typeCode))
+		clauses = append(clauses, "type = ?")
+		args = append(args, typeCode)
 	}
 	queryText := strings.TrimSpace(opts.Query)
 	if queryText != "" {
-		clauses = append(clauses, "content LIKE "+sqlQuote("%"+escapeLike(queryText)+"%")+" ESCAPE '\\'")
+		clauses = append(clauses, "content LIKE ? ESCAPE '\\'")
+		args = append(args, "%"+escapeLike(queryText)+"%")
 	}
 	whereSQL := ""
 	if len(clauses) > 0 {
@@ -120,39 +120,42 @@ func (s Service) List(ctx context.Context, opts QueryOptions) ([]Item, error) {
 	} else if opts.Offset > 0 {
 		limitSQL = fmt.Sprintf("LIMIT -1 OFFSET %d", opts.Offset)
 	}
-	sql := fmt.Sprintf(`
+	query := fmt.Sprintf(`
 SELECT
-  COALESCE(local_id, 0) AS local_id,
-  COALESCE(type, 0) AS type,
-  COALESCE(update_time, 0) AS update_time,
-  COALESCE(content, '') AS content,
-  COALESCE(fromusr, '') AS fromusr,
-  COALESCE(realchatname, '') AS realchatname
+  COALESCE(local_id, 0),
+  COALESCE(type, 0),
+  COALESCE(update_time, 0),
+  COALESCE(content, ''),
+  COALESCE(fromusr, ''),
+  COALESCE(realchatname, '')
 FROM fav_db_item
 %s
 ORDER BY update_time DESC
 %s;
 `, whereSQL, limitSQL)
-	cmd := exec.CommandContext(ctx, "sqlite3", "-json", sqlitecli.ImmutableURI(s.CacheDB), sql)
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
 	if err != nil {
-		return nil, fmt.Errorf("query favorites: %v: %s", err, bytes.TrimSpace(out))
+		return nil, err
 	}
-	var rows []struct {
-		ID         int64  `json:"local_id"`
-		Type       int64  `json:"type"`
-		UpdateTime int64  `json:"update_time"`
-		Content    string `json:"content"`
-		From       string `json:"fromusr"`
-		SourceChat string `json:"realchatname"`
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query favorites: %w", err)
 	}
-	if len(bytes.TrimSpace(out)) > 0 {
-		if err := json.Unmarshal(out, &rows); err != nil {
-			return nil, fmt.Errorf("parse sqlite json: %w", err)
+	defer rows.Close()
+	items := []Item{}
+	for rows.Next() {
+		var row struct {
+			ID         int64
+			Type       int64
+			UpdateTime int64
+			Content    string
+			From       string
+			SourceChat string
 		}
-	}
-	items := make([]Item, 0, len(rows))
-	for _, row := range rows {
+		if err := rows.Scan(&row.ID, &row.Type, &row.UpdateTime, &row.Content, &row.From, &row.SourceChat); err != nil {
+			return nil, err
+		}
 		ts := normalizeTimestamp(row.UpdateTime)
 		summary, content, url, detail, contentItems := s.parseFavoriteContent(row.Content, row.Type)
 		items = append(items, Item{
@@ -170,7 +173,7 @@ ORDER BY update_time DESC
 			SourceChat:    row.SourceChat,
 		})
 	}
-	return items, nil
+	return items, rows.Err()
 }
 
 func typeFilter(value string) (int64, bool, error) {
@@ -913,8 +916,4 @@ func escapeLike(value string) string {
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	value = strings.ReplaceAll(value, "%", "\\%")
 	return strings.ReplaceAll(value, "_", "\\_")
-}
-
-func sqlQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }

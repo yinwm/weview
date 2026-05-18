@@ -8,9 +8,10 @@ import (
 	"image/color"
 	"image/png"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"wxview/internal/sqlitedb/sqlitetest"
 )
 
 func TestResolveImagePathMacOS4ExactThumbnail(t *testing.T) {
@@ -171,7 +172,6 @@ func TestResolverAddsDirectVideoPathAndThumbnail(t *testing.T) {
 }
 
 func TestResolverFindsVideoFromResourceDB(t *testing.T) {
-	requireSQLite3(t)
 	dir := t.TempDir()
 	accountBase := filepath.Join(dir, "wxid_owner_bcc2")
 	dataDir := filepath.Join(accountBase, "db_storage")
@@ -191,9 +191,7 @@ CREATE TABLE video_hardlink_info_v4(md5 TEXT, file_name TEXT, file_size INTEGER,
 INSERT INTO dir2id(rowid, username) VALUES (1, 'room-hash');
 INSERT INTO video_hardlink_info_v4(md5, file_name, file_size, modify_time, dir1, dir2) VALUES ('abc123def456', 'abc123def456.mp4', 12, 1700000000, 1, 0);
 `
-	if out, err := exec.Command("sqlite3", resourceDB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create resource db: %v: %s", err, out)
-	}
+	createMediaTestDB(t, resourceDB, sql)
 
 	content := `<msg><videomsg md5="abc123def456" length="12" /></msg>`
 	resolver := NewResolver(dataDir, filepath.Join(dir, "cache"), resourceDB)
@@ -227,7 +225,6 @@ func TestResolveFilePathMacOS4(t *testing.T) {
 }
 
 func TestResolveVoiceFromMediaDB(t *testing.T) {
-	requireSQLite3(t)
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "wxid_owner_bcc2", "db_storage")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -240,9 +237,7 @@ INSERT INTO Name2Id(rowid, user_name) VALUES (9, 'alice');
 CREATE TABLE VoiceInfo(chat_name_id INTEGER, local_id INTEGER, svr_id INTEGER, voice_data BLOB);
 INSERT INTO VoiceInfo(chat_name_id, local_id, svr_id, voice_data) VALUES (9, 7, 0, X'02232153494C4B5F5633616263');
 `
-	if out, err := exec.Command("sqlite3", mediaDB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create media db: %v: %s", err, out)
-	}
+	createMediaTestDB(t, mediaDB, sql)
 	resolver := NewResolver(dataDir, filepath.Join(dir, "cache"), mediaDB)
 	info := resolver.ResolveVoice("alice", 7, 0, 34)
 	if info.Status != "resolved" || info.Path == "" {
@@ -258,16 +253,13 @@ INSERT INTO VoiceInfo(chat_name_id, local_id, svr_id, voice_data) VALUES (9, 7, 
 }
 
 func TestResolveAvatarFromHeadImageDB(t *testing.T) {
-	requireSQLite3(t)
 	dir := t.TempDir()
 	headDB := filepath.Join(dir, "head_image.db")
 	sql := `
 CREATE TABLE head_image(username TEXT, image_buffer BLOB);
 INSERT INTO head_image(username, image_buffer) VALUES ('alice', X'FFD8FF00');
 `
-	if out, err := exec.Command("sqlite3", headDB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("create head image db: %v: %s", err, out)
-	}
+	createMediaTestDB(t, headDB, sql)
 	info := ResolveAvatar(headDB, "alice", filepath.Join(dir, "cache"))
 	if info.Status != "resolved" || info.Path == "" {
 		t.Fatalf("unexpected avatar info: %+v", info)
@@ -331,9 +323,8 @@ func testMP4Bytes() []byte {
 	return append(data, []byte(fmt.Sprintf("%012d", 1))...)
 }
 
-func requireSQLite3(t *testing.T) {
+func createMediaTestDB(t *testing.T, path string, script string) {
 	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 is required for media DB tests")
-	}
+	db := sqlitetest.CreateDB(t, path, script)
+	db.Close()
 }

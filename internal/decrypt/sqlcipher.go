@@ -13,10 +13,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
 
 const (
@@ -162,7 +161,7 @@ func DecryptFile(ctx context.Context, src string, dst string, hexKey string) err
 	return out.Close()
 }
 
-// DecryptToCache writes a temporary decrypted database, validates it with sqlite3,
+// DecryptToCache writes a temporary decrypted database, validates it in-process,
 // then atomically replaces dst. A failed decrypt never overwrites the last cache.
 func DecryptToCache(ctx context.Context, src string, dst string, hexKey string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
@@ -194,12 +193,13 @@ func DecryptToCache(ctx context.Context, src string, dst string, hexKey string) 
 }
 
 func ValidateSQLite(ctx context.Context, dbPath string) error {
-	cmd := exec.CommandContext(ctx, "sqlite3", sqlitecli.ImmutableURI(dbPath), "PRAGMA schema_version;")
-	out, err := cmd.CombinedOutput()
+	db, err := sqlitedb.OpenReadOnly(ctx, dbPath)
 	if err != nil {
-		return fmt.Errorf("%v: %s", err, bytes.TrimSpace(out))
+		return err
 	}
-	return nil
+	defer db.Close()
+	var schemaVersion int
+	return db.QueryRowContext(ctx, "PRAGMA schema_version;").Scan(&schemaVersion)
 }
 
 func SaltHex(page1 []byte) string {

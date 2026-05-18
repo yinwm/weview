@@ -2,23 +2,12 @@ package media
 
 import (
 	"bytes"
-	"encoding/hex"
-	"encoding/json"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"strings"
 
-	"wxview/internal/sqlitecli"
+	"wxview/internal/sqlitedb"
 )
-
-type voiceRow struct {
-	DataHex string `json:"data_hex"`
-}
-
-type nameIDRow struct {
-	ID int64 `json:"id"`
-}
 
 func (r Resolver) ResolveVoice(chatUsername string, localID int64, serverID int64, rawType int64) Info {
 	if int64(uint64(rawType)&0xffffffff) != 34 {
@@ -68,39 +57,35 @@ func (r Resolver) writeVoiceData(sourcePath string, data []byte, cacheKey string
 }
 
 func queryVoiceByServerID(dbPath string, serverID int64) ([]byte, bool) {
-	query := fmt.Sprintf("SELECT hex(voice_data) AS data_hex FROM VoiceInfo WHERE svr_id = %d AND length(voice_data) > 0 LIMIT 1;", serverID)
-	return queryVoiceData(dbPath, query)
+	return queryVoiceData(dbPath, "SELECT voice_data FROM VoiceInfo WHERE svr_id = ? AND length(voice_data) > 0 LIMIT 1;", serverID)
 }
 
 func queryVoiceByLocalID(dbPath string, chatNameID int64, localID int64) ([]byte, bool) {
-	query := fmt.Sprintf("SELECT hex(voice_data) AS data_hex FROM VoiceInfo WHERE chat_name_id = %d AND local_id = %d AND length(voice_data) > 0 LIMIT 1;", chatNameID, localID)
-	return queryVoiceData(dbPath, query)
+	return queryVoiceData(dbPath, "SELECT voice_data FROM VoiceInfo WHERE chat_name_id = ? AND local_id = ? AND length(voice_data) > 0 LIMIT 1;", chatNameID, localID)
 }
 
-func queryVoiceData(dbPath string, query string) ([]byte, bool) {
-	cmd := exec.Command("sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), query)
-	out, err := cmd.CombinedOutput()
-	if err != nil || len(bytes.TrimSpace(out)) == 0 {
+func queryVoiceData(dbPath string, query string, args ...any) ([]byte, bool) {
+	db, err := sqlitedb.OpenReadOnly(context.Background(), dbPath)
+	if err != nil {
 		return nil, false
 	}
-	var rows []voiceRow
-	if err := json.Unmarshal(out, &rows); err != nil || len(rows) == 0 {
+	defer db.Close()
+	var data []byte
+	if err := db.QueryRowContext(context.Background(), query, args...).Scan(&data); err != nil || len(data) == 0 {
 		return nil, false
 	}
-	data, err := hex.DecodeString(strings.TrimSpace(rows[0].DataHex))
-	return data, err == nil && len(data) > 0
+	return data, true
 }
 
 func queryChatNameID(dbPath string, username string) (int64, bool) {
-	query := fmt.Sprintf("SELECT rowid AS id FROM Name2Id WHERE user_name = %s LIMIT 1;", sqlLiteral(username))
-	cmd := exec.Command("sqlite3", "-json", sqlitecli.ImmutableURI(dbPath), query)
-	out, err := cmd.CombinedOutput()
-	if err != nil || len(bytes.TrimSpace(out)) == 0 {
+	db, err := sqlitedb.OpenReadOnly(context.Background(), dbPath)
+	if err != nil {
 		return 0, false
 	}
-	var rows []nameIDRow
-	if err := json.Unmarshal(out, &rows); err != nil || len(rows) == 0 {
+	defer db.Close()
+	var id int64
+	if err := db.QueryRowContext(context.Background(), "SELECT rowid FROM Name2Id WHERE user_name = ? LIMIT 1;", username).Scan(&id); err != nil {
 		return 0, false
 	}
-	return rows[0].ID, rows[0].ID > 0
+	return id, id > 0
 }
