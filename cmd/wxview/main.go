@@ -52,6 +52,8 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return runInit(ctx, args[1:], stdout)
 	case "daemon":
 		return runDaemon(args[1:], stdout)
+	case "cache":
+		return runCache(args[1:], stdout)
 	case "contact", "contacts":
 		return runContacts(ctx, args[1:], stdout)
 	case "members":
@@ -106,6 +108,7 @@ Commands:
   wxview init       First-time setup: detect WeChat, get supported DB keys,
                     and save them locally. Usually run once at the beginning.
   wxview daemon     Show daemon help.
+  wxview cache      Inspect local decrypted cache freshness and key coverage.
   wxview contacts   List contacts from the decrypted contact cache.
   wxview members    List members and owner for an explicit chatroom username.
   wxview sessions   List recent chats from the decrypted session cache.
@@ -142,6 +145,7 @@ Common examples:
   wxview articles --query AI --date today --format json
   wxview sns feed --date today --limit 20 --format json
   wxview sns notifications --include-read --limit 20 --format json
+  wxview cache status --format table
   wxview daemon start
   wxview daemon status
 
@@ -174,6 +178,7 @@ Current scope:
   wxview favorites --help
   wxview articles --help
   wxview sns --help
+  wxview cache --help
   wxview daemon --help`)
 }
 
@@ -183,6 +188,8 @@ func commandHelp(command string, stdout io.Writer, stderr io.Writer) error {
 		initUsage(stdout)
 	case "daemon":
 		daemonUsage(stdout)
+	case "cache":
+		cacheUsage(stdout)
 	case "contact", "contacts":
 		contactsUsage(stdout)
 	case "members":
@@ -322,6 +329,62 @@ Notes:
   daemon start writes daemon logs to ~/.wxview/wxview.log.
   V1 does not patch or stream .db-wal, so refresh is near-real-time after WeChat
   checkpoints/writes the main DB.`)
+}
+
+func cacheUsage(w io.Writer) {
+	fmt.Fprintln(w, `wxview cache - Inspect local decrypted cache status
+
+Usage:
+  wxview cache
+  wxview cache status [--group GROUP] [--format table|json|jsonl|csv]
+  wxview cache --help
+
+Subcommands:
+  status         Report source DB, decrypted cache, mtime metadata, and key status.
+
+No-argument behavior:
+  wxview cache is intentionally the same as wxview cache --help.
+  It does not refresh, decrypt, scan process memory, or talk to the daemon.
+
+Groups:
+  all            Every discovered supported DB. This is the default.
+  contacts       contact/contact.db.
+  messages       message/message_*.db, biz_message_*.db, and message auxiliary DBs.
+  media          message/media_*.db.
+  sessions       session/session.db.
+  avatars        head_image/head_image.db.
+  favorites      favorite/favorite.db.
+  sns            sns/sns.db.
+
+Flags:
+  --group all|contacts|messages|media|sessions|avatars|favorites|sns
+  --format table   Human-readable table output.
+  --format json    JSON object with count and items.
+  --format jsonl   Newline-delimited JSON, one DB status item per line.
+  --format csv     CSV with header row.
+
+Output fields:
+  group, account, db_rel_path, status, key_status, source_size, cache_size,
+  source_mtime, cache_mtime, refreshed_at, and reason.
+  JSON output also includes data_dir, source_path, cache_path, source_exists,
+  and cache_exists.
+
+Status values:
+  fresh          Cache exists and mtime metadata matches the source DB.
+  stale          Cache exists, but metadata is missing, unreadable, or mismatched.
+  missing_cache  Source DB exists, but the decrypted cache file is missing.
+  missing_source Source DB path disappeared after discovery.
+
+Key status values:
+  available      keys.json contains a valid key for the current source salt.
+  missing        No saved key matches this DB and current salt.
+  invalid        A saved key exists but no longer validates page 1 HMAC.
+  unknown        Key store or source salt could not be inspected.
+
+Examples:
+  wxview cache status
+  wxview cache status --group messages --format json
+  wxview cache status --group media --format csv`)
 }
 
 func contactsUsage(w io.Writer) {
@@ -1029,6 +1092,47 @@ func runDaemonStatus(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintln(stdout, "status: stopped")
 	return nil
+}
+
+func runCache(args []string, stdout io.Writer) error {
+	if len(args) == 0 || hasHelp(args) {
+		cacheUsage(stdout)
+		return nil
+	}
+	switch args[0] {
+	case "status":
+		return runCacheStatus(args[1:], stdout)
+	default:
+		return fmt.Errorf("unknown cache command: %s; supported form is `wxview cache status`", args[0])
+	}
+}
+
+func runCacheStatus(args []string, stdout io.Writer) error {
+	if hasHelp(args) {
+		cacheUsage(stdout)
+		return nil
+	}
+	fs := flag.NewFlagSet("cache status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	format := fs.String("format", "table", "table, json, jsonl, or csv")
+	group := fs.String("group", key.CacheGroupAll, "all, contacts, messages, media, sessions, avatars, favorites, or sns")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected cache status argument: %s", fs.Arg(0))
+	}
+	if !validFormat(*format) {
+		return fmt.Errorf("invalid format %q: use table, json, jsonl, or csv", *format)
+	}
+	if _, err := key.NormalizeCacheStatusGroup(*group); err != nil {
+		return err
+	}
+	items, err := key.CacheStatuses(*group)
+	if err != nil {
+		return err
+	}
+	return writeCacheStatuses(stdout, items, *format)
 }
 
 func waitForDaemonHealthy(ctx context.Context, client daemon.Client, timeout time.Duration, exitCh <-chan error) (bool, error) {
@@ -2664,6 +2768,7 @@ var articleAccountFields = []string{"username", "alias", "remark", "nick_name", 
 var articleFields = []string{"id", "account_username", "account_display_name", "time", "timestamp", "type", "text", "title", "desc", "url", "source_username", "source_display_name", "nickname", "message_id"}
 var snsPostFields = []string{"id", "author_username", "time", "timestamp", "content", "location", "media_count"}
 var snsNotificationFields = []string{"id", "type", "from_username", "from_nick_name", "content", "feed_id", "feed_author_username", "feed_preview", "time", "timestamp"}
+var cacheStatusFields = []string{"group", "account", "db_rel_path", "status", "key_status", "source_size", "cache_size", "source_mtime", "cache_mtime", "refreshed_at", "reason"}
 
 func writeContacts(w io.Writer, list []contacts.Contact, format string) error {
 	switch format {
@@ -2912,6 +3017,21 @@ func writeSNSNotifications(w io.Writer, list []sns.Notification, format string) 
 		return writeRows(w, snsNotificationFields, len(list), func(i int) []string { return snsNotificationValues(list[i]) })
 	case "table":
 		return writeTable(w, snsNotificationFields, len(list), func(i int) []string { return snsNotificationValues(list[i]) })
+	default:
+		return fmt.Errorf("unsupported format: %s", format)
+	}
+}
+
+func writeCacheStatuses(w io.Writer, list []key.CacheStatusItem, format string) error {
+	switch format {
+	case "json":
+		return writeItemsObject(w, list)
+	case "jsonl":
+		return writeJSONLines(w, list)
+	case "csv":
+		return writeRows(w, cacheStatusFields, len(list), func(i int) []string { return cacheStatusValues(list[i]) })
+	case "table":
+		return writeTable(w, cacheStatusFields, len(list), func(i int) []string { return cacheStatusValues(list[i]) })
 	default:
 		return fmt.Errorf("unsupported format: %s", format)
 	}
@@ -3167,6 +3287,22 @@ func snsNotificationValues(item sns.Notification) []string {
 		item.FeedPreview,
 		item.Time,
 		strconv.FormatInt(item.Timestamp, 10),
+	}
+}
+
+func cacheStatusValues(item key.CacheStatusItem) []string {
+	return []string{
+		item.Group,
+		item.Account,
+		item.DBRelPath,
+		item.Status,
+		item.KeyStatus,
+		strconv.FormatInt(item.SourceSize, 10),
+		strconv.FormatInt(item.CacheSize, 10),
+		item.SourceMTime,
+		item.CacheMTime,
+		item.RefreshedAt,
+		item.Reason,
 	}
 }
 

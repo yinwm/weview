@@ -18,6 +18,7 @@ func TestRootHelpIsDescriptive(t *testing.T) {
 		"wxview - Read local WeChat data",
 		"Machine-readable usage",
 		"wxview init",
+		"wxview cache",
 		"wxview contacts --help",
 		"wxview members --help",
 		"wxview sessions --help",
@@ -29,6 +30,7 @@ func TestRootHelpIsDescriptive(t *testing.T) {
 		"wxview favorites --help",
 		"wxview articles --help",
 		"wxview sns --help",
+		"wxview cache --help",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("root help missing %q:\n%s", want, text)
@@ -332,6 +334,53 @@ func TestDaemonWithoutArgsShowsHelp(t *testing.T) {
 	}
 	if out.String() != help.String() {
 		t.Fatalf("daemon without args should match daemon --help\nwithout args:\n%s\nhelp:\n%s", out.String(), help.String())
+	}
+}
+
+func TestCacheHelpIsActionable(t *testing.T) {
+	var out bytes.Buffer
+	if err := run([]string{"cache", "--help"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{
+		"wxview cache - Inspect local decrypted cache status",
+		"wxview cache status",
+		"--group all|contacts|messages|media|sessions|avatars|favorites|sns",
+		"fresh",
+		"stale",
+		"missing_cache",
+		"key_status",
+		"does not refresh, decrypt, scan process memory, or talk to the daemon",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("cache help missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestCacheWithoutArgsShowsHelp(t *testing.T) {
+	var out bytes.Buffer
+	if err := run([]string{"cache"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	var help bytes.Buffer
+	if err := run([]string{"cache", "--help"}, &help, &help); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != help.String() {
+		t.Fatalf("cache without args should match cache --help\nwithout args:\n%s\nhelp:\n%s", out.String(), help.String())
+	}
+}
+
+func TestCacheStatusRejectsUnknownGroupBeforeDiscovery(t *testing.T) {
+	var out bytes.Buffer
+	err := run([]string{"cache", "status", "--group", "indexes"}, &out, &out)
+	if err == nil {
+		t.Fatal("expected invalid cache status group to be rejected")
+	}
+	if !strings.Contains(err.Error(), "invalid cache group") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
