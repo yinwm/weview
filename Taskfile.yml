@@ -1,7 +1,7 @@
 version: "3"
 
 vars:
-  BIN: ./bin/wxview
+  BIN: ./bin/wxview{{if eq OS "windows"}}.exe{{end}}
   GOCACHE: "{{.ROOT_DIR}}/.cache/go-build"
 
 tasks:
