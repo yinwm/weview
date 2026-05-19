@@ -62,14 +62,19 @@ func (r Resolver) ResolveVideo(chatUsername string, localID int64, createTime in
 	sourcePath := found.path
 	decoded := false
 	if strings.HasSuffix(strings.ToLower(path), ".dat") {
-		out, err := r.decryptVideoToCache(path)
-		if err != nil {
-			info := decryptFailed("video", sourcePath, err.Error(), false)
-			r.attachVideoThumbnail(&info, found)
-			return info
+		if out, ok := r.lookupDecodedCache(path); ok {
+			path = out
+			decoded = true
+		} else {
+			out, err := r.decryptVideoToCache(path)
+			if err != nil {
+				info := decryptFailed("video", sourcePath, err.Error(), false)
+				r.attachVideoThumbnail(&info, found)
+				return info
+			}
+			path = out
+			decoded = true
 		}
-		path = out
-		decoded = true
 	}
 
 	info := resolved("video", path, sourcePath, decoded, found.thumbnailPath != "")
@@ -310,13 +315,18 @@ func (r Resolver) attachVideoThumbnail(info *Info, found videoCandidate) {
 	sourcePath := firstNonEmptyString(found.thumbnailSourcePath, found.thumbnailPath)
 	decoded := found.thumbnailDecoded
 	if strings.HasSuffix(strings.ToLower(path), ".dat") {
-		out, err := r.decryptImageToCache(path)
-		if err != nil {
-			info.ThumbnailSourcePath = sourcePath
-			return
+		if out, ok := r.lookupDecodedCache(path); ok {
+			path = out
+			decoded = true
+		} else {
+			out, err := r.decryptImageToCache(path)
+			if err != nil {
+				info.ThumbnailSourcePath = sourcePath
+				return
+			}
+			path = out
+			decoded = true
 		}
-		path = out
-		decoded = true
 	}
 	info.Thumbnail = true
 	info.ThumbnailPath = path

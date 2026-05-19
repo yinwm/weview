@@ -259,8 +259,6 @@ type sessionSnapshotRow struct {
 	Username      string
 	TableName     string
 	LastTimestamp int64
-	UnreadCount   int64
-	SummaryHash   string
 	RefreshedAt   string
 }
 
@@ -1336,6 +1334,9 @@ func refreshReadyIndex(ctx context.Context, opts BuildOptions, tableToChat map[s
 	indexedRows := indexedRowCountDB(ctx, indexDB)
 	if planStats.RefreshMode == "session_delta" {
 		if hints, ok := loadSessionHints(ctx, opts.SessionCachePath); ok {
+			if err := bootstrapCoveredSessionSnapshotsDB(ctx, indexDB, hints, watermarks, indexedAt); err != nil {
+				return err
+			}
 			snapshots, err := loadSessionSnapshotsDB(ctx, indexDB)
 			if err != nil {
 				return err
@@ -1469,14 +1470,14 @@ func loadSessionSnapshotsDB(ctx context.Context, db *sql.DB) (map[string]session
 	if !ok {
 		return out, nil
 	}
-	rows, err := db.QueryContext(ctx, "SELECT username, table_name, last_timestamp, unread_count, summary_hash, refreshed_at FROM session_snapshot;")
+	rows, err := db.QueryContext(ctx, "SELECT username, table_name, last_timestamp, refreshed_at FROM session_snapshot;")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var row sessionSnapshotRow
-		if err := rows.Scan(&row.Username, &row.TableName, &row.LastTimestamp, &row.UnreadCount, &row.SummaryHash, &row.RefreshedAt); err != nil {
+		if err := rows.Scan(&row.Username, &row.TableName, &row.LastTimestamp, &row.RefreshedAt); err != nil {
 			return nil, err
 		}
 		out[row.Username] = row
@@ -1486,16 +1487,29 @@ func loadSessionSnapshotsDB(ctx context.Context, db *sql.DB) (map[string]session
 
 func upsertSessionSnapshotDB(ctx context.Context, db *sql.DB, hint sessions.IndexHint, refreshedAt string) error {
 	_, err := db.ExecContext(ctx, `
-INSERT OR REPLACE INTO session_snapshot(username, table_name, last_timestamp, unread_count, summary_hash, refreshed_at)
-VALUES (?, ?, ?, ?, ?, ?);`,
+INSERT OR REPLACE INTO session_snapshot(username, table_name, last_timestamp, refreshed_at)
+VALUES (?, ?, ?, ?);`,
 		hint.Username,
 		hint.TableName,
 		hint.LastTimestamp,
-		hint.UnreadCount,
-		hint.SummaryHash,
 		refreshedAt,
 	)
 	return err
+}
+
+func bootstrapCoveredSessionSnapshotsDB(ctx context.Context, db *sql.DB, hints map[string]sessions.IndexHint, watermarks map[string]chatTableMetaRow, refreshedAt string) error {
+	for _, hint := range hints {
+		if hint.LastTimestamp <= 0 {
+			continue
+		}
+		if maxCreateTimeForTable(watermarks, hint.TableName) < hint.LastTimestamp {
+			continue
+		}
+		if err := upsertSessionSnapshotDB(ctx, db, hint, refreshedAt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func prepareHotRefreshPlan(ctx context.Context, messageCachePaths []string, tableToChat map[string]string, watermarks map[string]chatTableMetaRow, indexedSources []sourceRow, hints map[string]sessions.IndexHint, snapshots map[string]sessionSnapshotRow) ([]refreshSourcePlan, refreshPlanStats, error) {
@@ -1703,16 +1717,14 @@ func sortedSessionHints(hints map[string]sessions.IndexHint) []sessions.IndexHin
 }
 
 func sessionHintNeedsRefresh(hint sessions.IndexHint, snapshot sessionSnapshotRow, watermarks map[string]chatTableMetaRow) bool {
-	if strings.TrimSpace(snapshot.Username) == "" {
-		return true
+	if hint.LastTimestamp <= 0 {
+		return false
 	}
-	if hint.LastTimestamp > snapshot.LastTimestamp {
-		return true
+	maxCreateTime := maxCreateTimeForTable(watermarks, hint.TableName)
+	if maxCreateTime <= 0 {
+		return strings.TrimSpace(snapshot.Username) != ""
 	}
-	if hint.UnreadCount != snapshot.UnreadCount || hint.SummaryHash != snapshot.SummaryHash {
-		return true
-	}
-	return maxCreateTimeForTable(watermarks, hint.TableName) < hint.LastTimestamp
+	return maxCreateTime < hint.LastTimestamp
 }
 
 func sessionLagSeconds(hints map[string]sessions.IndexHint, snapshots map[string]sessionSnapshotRow) int64 {
@@ -1902,6 +1914,9 @@ func ensureIndexSchemaDB(ctx context.Context, db *sql.DB) error {
 	if err := sqlitedb.ExecScript(ctx, db, schemaSQL()); err != nil {
 		return fmt.Errorf("ensure message index schema: %w", err)
 	}
+	if err := ensureSessionSnapshotSchemaDB(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1932,6 +1947,52 @@ func setMetaDB(ctx context.Context, db *sql.DB, values map[string]string) error 
 		}
 	}
 	return tx.Commit()
+}
+
+func ensureSessionSnapshotSchemaDB(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info(session_snapshot);")
+	if err != nil {
+		return err
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	compatible := columns["username"] &&
+		columns["table_name"] &&
+		columns["last_timestamp"] &&
+		columns["refreshed_at"] &&
+		!columns["unread_count"] &&
+		!columns["summary_hash"]
+	if compatible {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS session_snapshot;"); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `
+CREATE TABLE session_snapshot(
+  username TEXT PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  last_timestamp INTEGER NOT NULL,
+  refreshed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_snapshot_table ON session_snapshot(table_name);
+`)
+	return err
 }
 
 func metaValue(ctx context.Context, indexPath string, key string) string {
@@ -1983,8 +2044,6 @@ CREATE TABLE IF NOT EXISTS session_snapshot(
   username TEXT PRIMARY KEY,
   table_name TEXT NOT NULL,
   last_timestamp INTEGER NOT NULL,
-  unread_count INTEGER NOT NULL,
-  summary_hash TEXT NOT NULL,
   refreshed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_session_snapshot_table ON session_snapshot(table_name);

@@ -231,7 +231,7 @@ daemon 使用本地 Unix socket：
 - `stale`：索引本身存在，但落后当前 message cache 太久，默认查询走原始扫描。
 - `schema_mismatch`：索引 schema version 与当前程序不匹配，`index refresh` 会重建，或可显式执行 `rebuild --reset`。
 
-`refresh_mode=session_delta` 表示 refresh 正在走会话增量热路径，不是在枚举整个大库；`reconcile_sources_pending` 表示还有 source DB 需要后台小批量核对。reconcile 是兜底，不影响已经追平的 chat 走索引。
+`refresh_mode=session_delta` 表示 refresh 正在走会话增量热路径，不是在枚举整个大库。这个热路径只用 `session/session.db` 的 `SessionTable.last_timestamp` 和 chat watermark 判断是否需要追某个 chat；`unread_count`、摘要变化不触发 message index refresh。`reconcile_sources_pending` 表示还有 source DB 需要后台小批量核对。reconcile 是兜底，不影响已经追平的 chat 走索引。
 
 滞后策略固定为 60 秒：`lag_seconds <= 60` 表示准实时延迟，`messages` 和 `timeline` 可以继续走索引；`lag_seconds > 60` 表示全局 source DB 还有较多待追赶内容，默认查询会回落到原来的本地扫描路径。即使整体 `stale`，如果查询时间范围完全落在已索引 watermark 之前，或者查询 chat 已经追到当前 `session.db` 的 `last_timestamp`，仍可以走索引；`timeline` 只有在全部选中 chat 都满足这个条件时才走索引。两个命令都支持 `--no-index` 强制走扫描路径，便于排查性能和结果差异。`search` 继续保持本地扫描语义，避免 FTS 分词和包含匹配的结果不一致。
 
@@ -429,11 +429,13 @@ daemon 使用本地 Unix socket：
 - 命令读取本地解密缓存里的 `message/message_*.db`，不会扫描微信进程内存。
 - 如果 `~/.wxview/cache/<account>/index/messages.db` 是 ready 且准实时，或当前 chat 已经按 `session.db` 追平，命令会先从索引查当前页 row refs，再回原 decrypted cache 读取正文并复用同一套 normalize / media 解析逻辑。
 - 如果索引 missing、building、schema_mismatch，或 stale 且当前查询 chat 没有追平，命令会自动回落到旧扫描逻辑。
+- `messages --username` 只按需查询这个 username 的联系人信息来补 `chat_display_name`，不会为了单个会话全量读取 contact cache。
+- `messages --trace-time` 会把分阶段耗时写到 stderr，例如 cache path、index/scan 查询、media 解析、联系人补全和输出写入；JSON stdout 仍然保持有效。
 - 默认排序是 `create_time` 正序，再按 `seq`、本地行 id、分片名稳定排序。机器分页优先使用 `--after-seq` 或 `meta.next_args`，避免用大 `--offset` 反复扫描。
 - 默认查询只读取现有完整缓存；自动刷新由 daemon 负责维护。
 - `--refresh` 会显式刷新消息正文分片和消息辅助库，优先请求 daemon；daemon 不在时在当前进程刷新。
 - 如果缺少对应 message DB 的 key，命令会提示先带进程内存读取权限运行 `wxview init`，不会在查询路径临时扫描 key。
-- 当前支持图片、视频、文件和语音的本地路径解析。图片 `.dat` 会自动解密；视频会先查 `message_resource.db` 的 hardlink 元数据，再回退到 WeChat 本地目录 best-effort 查找，普通视频直接返回路径，可识别的 `.dat` 视频会规范化到媒体缓存；文件会优先查 hardlink 元数据并回退到本地文件目录；语音会从 `message/media_*.db` 的 `VoiceInfo.voice_data` 导出为 `.silk` 到媒体缓存。
+- 当前支持图片、视频、文件和语音的本地路径解析。图片 `.dat` 会自动解密；视频会先查 `message_resource.db` 的 hardlink 元数据，再回退到 WeChat 本地目录 best-effort 查找，普通视频直接返回路径，可识别的 `.dat` 视频会规范化到媒体缓存；文件会优先查 hardlink 元数据并回退到本地文件目录；语音会对当前页做批量查询，一次打开 `message/media_*.db` 并复用 `Name2Id`/`VoiceInfo` 查询结果，再把 `VoiceInfo.voice_data` 内置解码为 `.wav` 到媒体缓存，不要求用户机器安装 ffmpeg。
 
 ### `wxview search`
 
@@ -637,7 +639,7 @@ Wxview 的实现过程中参考并受益于这些开源项目：
 - 最近会话、未读会话和增量新消息
 - `message/message_*.db`
 - 按明确 username 查询聊天记录、消息正文搜索、常见 XML 摘要和图片/视频/文件/语音本地路径解析
-- `message/media_*.db` 语音数据导出
+- `message/media_*.db` 语音数据解码为 WAV
 - `head_image/head_image.db` 本地头像导出
 - 群成员和群主
 - `favorite/favorite.db`
@@ -649,7 +651,7 @@ Wxview 的实现过程中参考并受益于这些开源项目：
 
 - Linux
 - macOS 微信 3.x
-- SILK 转 MP3/WAV 或语音转写
+- 语音转文字
 - WAL patch
 - 公开 Web API
 

@@ -69,7 +69,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	case "new-messages":
 		return runNewMessages(ctx, args[1:], stdout)
 	case "messages":
-		return runMessages(ctx, args[1:], stdout)
+		return runMessages(ctx, args[1:], stdout, stderr)
 	case "search":
 		return runSearch(ctx, args[1:], stdout)
 	case "timeline":
@@ -663,6 +663,8 @@ Flags:
   --offset N       Skip N rows after global time sorting.
   --source         Include source DB/table/local row metadata for debugging.
   --no-index       Force the old scan path even when a ready index exists.
+  --trace-time     Write per-stage timing trace to stderr. JSON stdout remains
+                   valid, so use "2>trace.log" to capture it.
   --refresh        Decrypt message/message_*.db shards and supported
                    message-related DBs into the local cache before querying. Without --refresh,
                    uses the existing complete cache when available; otherwise
@@ -1839,11 +1841,12 @@ func runNewMessages(ctx context.Context, args []string, stdout io.Writer) error 
 	return writeMessages(stdout, page, *format, *includeSource)
 }
 
-func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
+func runMessages(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 || hasHelp(args) {
 		messagesUsage(stdout)
 		return nil
 	}
+	trace := newTimingTrace(flagProvided(args, "trace-time"), stderr, "messages")
 	fs := flag.NewFlagSet("messages", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	format := fs.String("format", "table", "table, json, jsonl, or csv")
@@ -1857,9 +1860,12 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 	includeSource := fs.Bool("source", false, "include source DB/table/local row metadata")
 	noIndex := fs.Bool("no-index", false, "force old message-cache scan path")
 	refresh := fs.Bool("refresh", false, "refresh decrypted message caches before listing")
+	traceTime := fs.Bool("trace-time", false, "write per-stage timing trace to stderr")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	trace.Enabled = *traceTime
+	trace.Mark("parse_args")
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected search argument: %s", fs.Arg(0))
 	}
@@ -1882,6 +1888,7 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	trace.Mark("parse_range", traceBool("has_start", hasStart), traceBool("has_end", hasEnd))
 
 	queryLimit := *limit
 	if *format == "json" && *limit > 0 {
@@ -1891,16 +1898,13 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	trace.Mark("message_cache_paths", traceInt("cache_db_count", len(cachePaths)), traceBool("refresh", *refresh))
 	usernameValue := strings.TrimSpace(*username)
 	target, err := key.DiscoverContactDB()
 	if err != nil {
 		return err
 	}
-	cacheDir, err := media.MediaCacheDir(target.Account)
-	if err != nil {
-		return err
-	}
-	resolver := newMediaResolver(target, cacheDir)
+	trace.Mark("discover_account")
 	service := messages.NewService(cachePaths)
 	list, execution, err := listMessagesMaybeIndex(ctx, target.Account, cachePaths, service, !*noIndex, messages.QueryOptions{
 		Username:      usernameValue,
@@ -1911,14 +1915,30 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 		HasEnd:        hasEnd,
 		HasAfterSeq:   *afterSeq > 0,
 		IncludeSource: *includeSource,
-		MediaResolver: &resolver,
 		Limit:         queryLimit,
 		Offset:        *offset,
 	})
 	if err != nil {
 		return err
 	}
-	messages.ApplyChatInfo(list, loadExistingChatInfoMap(ctx))
+	trace.Mark("query_rows", traceInt("rows", len(list)), "query_mode="+execution.QueryMode, "index_status="+execution.IndexStatus, "index_reason="+execution.IndexReason)
+	mediaRows, voiceRows := countPotentialMediaRows(list)
+	if mediaRows > 0 {
+		cacheDir, err := media.MediaCacheDir(target.Account)
+		if err != nil {
+			return err
+		}
+		trace.Mark("media_cache_dir")
+		resolver := newMediaResolver(target, cacheDir)
+		trace.Mark("media_resolver", traceInt("resource_dbs", len(resolver.ResourceDBs)))
+		messages.EnrichMediaDetails(list, &resolver)
+		trace.Mark("enrich_media", traceInt("media_rows", mediaRows), traceInt("voice_rows", voiceRows))
+	} else {
+		trace.Mark("enrich_media", "skipped=true", traceInt("media_rows", 0), traceInt("voice_rows", 0))
+	}
+	chatInfo := chatInfoMapForUsernames(ctx, usernameValue)
+	trace.Mark("chat_info", traceInt("matches", len(chatInfo)))
+	messages.ApplyChatInfo(list, chatInfo)
 	if *format == "json" {
 		page, hasMore := trimMessagePage(list, *limit)
 		meta := messagesMeta{
@@ -1937,9 +1957,15 @@ func runMessages(ctx context.Context, args []string, stdout io.Writer) error {
 			meta.NextAfterSeq = page[len(page)-1].Seq
 			meta.NextArgs = buildMessagesNextArgs(usernameValue, start, hasStart, end, hasEnd, meta.NextAfterSeq, *limit, *includeSource, *noIndex)
 		}
-		return writeMessageEnvelope(stdout, meta, page)
+		err := writeMessageEnvelope(stdout, meta, page)
+		trace.Mark("write_output", "format=json", traceInt("returned", len(page)))
+		trace.Mark("total")
+		return err
 	}
-	return writeMessages(stdout, list, *format, *includeSource)
+	err = writeMessages(stdout, list, *format, *includeSource)
+	trace.Mark("write_output", "format="+*format, traceInt("returned", len(list)))
+	trace.Mark("total")
+	return err
 }
 
 func runSearch(ctx context.Context, args []string, stdout io.Writer) error {
@@ -2620,7 +2646,7 @@ func selectSearchChats(ctx context.Context, username string, kind string, query 
 				return nil, 0, err
 			}
 		}
-		info := loadExistingChatInfoMap(ctx)[username]
+		info := chatInfoForUsername(ctx, username)
 		if strings.TrimSpace(info.Username) == "" {
 			info = messages.ChatInfo{Username: username, Kind: messages.ChatKindUnknown, DisplayName: username}
 		}
@@ -2649,7 +2675,7 @@ func selectTimelineChats(ctx context.Context, username string, kind string, quer
 				return nil, 0, err
 			}
 		}
-		info := loadExistingChatInfoMap(ctx)[username]
+		info := chatInfoForUsername(ctx, username)
 		if strings.TrimSpace(info.Username) == "" {
 			info = messages.ChatInfo{Username: username, Kind: messages.ChatKindUnknown, DisplayName: username}
 		}
@@ -2685,6 +2711,33 @@ func loadExistingChatInfoMap(ctx context.Context) map[string]messages.ChatInfo {
 		return nil
 	}
 	return chatInfoMapFromContacts(list)
+}
+
+func chatInfoForUsername(ctx context.Context, username string) messages.ChatInfo {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return messages.ChatInfo{}
+	}
+	_, path, ok := key.HasContactCache()
+	if !ok {
+		return messages.ChatInfo{Username: username, Kind: messages.ChatKindUnknown, DisplayName: username}
+	}
+	contact, found, err := contacts.NewService(path).Lookup(ctx, username)
+	if err != nil || !found {
+		return messages.ChatInfo{Username: username, Kind: messages.ChatKindUnknown, DisplayName: username}
+	}
+	return chatInfoFromContact(contact)
+}
+
+func chatInfoMapForUsernames(ctx context.Context, usernames ...string) map[string]messages.ChatInfo {
+	out := make(map[string]messages.ChatInfo, len(usernames))
+	for _, username := range usernames {
+		info := chatInfoForUsername(ctx, username)
+		if strings.TrimSpace(info.Username) != "" {
+			out[info.Username] = info
+		}
+	}
+	return out
 }
 
 func chatInfoMapFromContacts(list []contacts.Contact) map[string]messages.ChatInfo {
@@ -3250,6 +3303,70 @@ func trimMessagePage(list []messages.Message, limit int) ([]messages.Message, bo
 		return list, false
 	}
 	return list[:limit], true
+}
+
+type timingTrace struct {
+	Enabled bool
+	command string
+	w       io.Writer
+	start   time.Time
+	last    time.Time
+}
+
+func newTimingTrace(enabled bool, w io.Writer, command string) *timingTrace {
+	if w == nil {
+		w = io.Discard
+	}
+	now := time.Now()
+	return &timingTrace{
+		Enabled: enabled,
+		command: command,
+		w:       w,
+		start:   now,
+		last:    now,
+	}
+}
+
+func (t *timingTrace) Mark(phase string, fields ...string) {
+	if t == nil || !t.Enabled {
+		return
+	}
+	now := time.Now()
+	duration := now.Sub(t.last)
+	total := now.Sub(t.start)
+	t.last = now
+	fmt.Fprintf(t.w, "trace_time command=%s phase=%s duration_ms=%.3f total_ms=%.3f", t.command, phase, float64(duration.Microseconds())/1000, float64(total.Microseconds())/1000)
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		fmt.Fprintf(t.w, " %s", field)
+	}
+	fmt.Fprintln(t.w)
+}
+
+func traceInt(name string, value int) string {
+	return name + "=" + strconv.Itoa(value)
+}
+
+func traceBool(name string, value bool) string {
+	return name + "=" + strconv.FormatBool(value)
+}
+
+func countPotentialMediaRows(list []messages.Message) (int, int) {
+	mediaRows := 0
+	voiceRows := 0
+	for _, msg := range list {
+		switch msg.Type {
+		case 3, 34, 43, 49:
+			mediaRows++
+		}
+		if msg.Type == 34 {
+			voiceRows++
+		}
+	}
+	return mediaRows, voiceRows
 }
 
 func formatMetaTime(ts int64, ok bool) string {

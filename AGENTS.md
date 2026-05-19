@@ -128,6 +128,8 @@ paths automatically when the supporting caches are available.
 - `wxview messages` resolves image, video, file, and voice usability automatically for
   returned rows. It should resolve local media files from WeChat storage and
   decode supported `.dat` media into `~/.wxview/cache/<account>/media/`.
+  Voice media should be decoded from `VoiceInfo.voice_data` into playable WAV
+  files in the same media cache without requiring a system ffmpeg install.
   Put the result in `content_detail`, not a separate top-level `media` object:
   include `media_status`, `path`, `source_path`, `decoded`, `thumbnail`,
   `thumbnail_path`, `thumbnail_source_path`, `thumbnail_decoded`, `width`,

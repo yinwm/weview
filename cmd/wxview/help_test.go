@@ -124,6 +124,7 @@ func TestMessagesHelpIsActionable(t *testing.T) {
 		"--limit N",
 		"--offset N",
 		"--source",
+		"--trace-time",
 		"meta.schema_version",
 		"meta.timezone",
 		"meta.next_args",

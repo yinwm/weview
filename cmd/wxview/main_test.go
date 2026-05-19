@@ -189,6 +189,24 @@ func TestWriteMessageEnvelopeJSON(t *testing.T) {
 	}
 }
 
+func TestTimingTraceWritesDurations(t *testing.T) {
+	var out bytes.Buffer
+	trace := newTimingTrace(true, &out, "messages")
+	trace.Mark("query_rows", "rows=2", "query_mode=index")
+	text := out.String()
+	for _, want := range []string{
+		"trace_time command=messages phase=query_rows",
+		"duration_ms=",
+		"total_ms=",
+		"rows=2",
+		"query_mode=index",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("trace output missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestLocalTimezoneNamePrefersTZ(t *testing.T) {
 	t.Setenv("TZ", "Asia/Shanghai")
 	if got := localTimezoneName(); got != "Asia/Shanghai" {

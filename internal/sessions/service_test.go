@@ -101,7 +101,7 @@ VALUES ('wxid_b', 0, X'776F726C64', 1700000100, 1, '', '');
 	if len(got) != 2 {
 		t.Fatalf("got %d hints, want 2", len(got))
 	}
-	if got[0].Username != "wxid_a" || got[0].TableName != messages.TableName("wxid_a") || got[0].LastTimestamp != 1700000200 || got[0].UnreadCount != 1 || got[0].SummaryHash == "" {
+	if got[0].Username != "wxid_a" || got[0].TableName != messages.TableName("wxid_a") || got[0].LastTimestamp != 1700000200 {
 		t.Fatalf("unexpected first hint: %+v", got[0])
 	}
 }

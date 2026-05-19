@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"image"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"wxview/internal/app"
@@ -35,6 +37,11 @@ var (
 	wechatV2Magic = []byte{0x07, 0x08, 0x56, 0x32, 0x08, 0x07}
 	kvcommPattern = regexp.MustCompile(`(?i)^key_(\d+)_.+\.statistic$`)
 )
+
+var decodedCacheManifests = struct {
+	sync.Mutex
+	byDir map[string]decodedCacheManifest
+}{byDir: map[string]decodedCacheManifest{}}
 
 type Info struct {
 	Kind                string `json:"kind"`
@@ -56,6 +63,20 @@ type Resolver struct {
 	CacheDir    string
 	ResourceDBs []string
 	keys        imageKeyMaterial
+}
+
+type decodedCacheManifest struct {
+	Entries map[string]decodedCacheEntry `json:"entries"`
+}
+
+type decodedCacheEntry struct {
+	SourcePath    string `json:"source_path"`
+	SourceSize    int64  `json:"source_size"`
+	SourceMTimeNS int64  `json:"source_mtime_ns"`
+	CacheKey      string `json:"cache_key"`
+	Ext           string `json:"ext"`
+	CachedPath    string `json:"cached_path"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 type imageKeyMaterial struct {
@@ -113,12 +134,18 @@ func (r Resolver) ResolveImage(chatUsername string, localID int64, createTime in
 	if !strings.HasSuffix(strings.ToLower(found.path), ".dat") {
 		return withImageDimensions(resolved("image", found.path, found.path, false, found.thumbnail))
 	}
+	if out, ok := r.lookupDecodedCache(found.path); ok {
+		return withImageDimensions(resolved("image", out, found.path, true, found.thumbnail))
+	}
 	out, err := r.decryptImageToCache(found.path)
 	if err == nil {
 		return withImageDimensions(resolved("image", out, found.path, true, found.thumbnail))
 	}
 	if !found.thumbnail {
 		if thumb, ok := thumbnailVariant(found.path); ok && thumb != found.path {
+			if out, ok := r.lookupDecodedCache(thumb); ok {
+				return withImageDimensions(resolved("image", out, thumb, true, true))
+			}
 			if out, thumbErr := r.decryptImageToCache(thumb); thumbErr == nil {
 				return withImageDimensions(resolved("image", out, thumb, true, true))
 			}
@@ -330,11 +357,150 @@ func (r Resolver) writeDecodedToCache(path string, bytes []byte, ext string, cac
 	digest := hex.EncodeToString(h.Sum(nil))
 	outPath := filepath.Join(r.CacheDir, digest[:24]+"."+ext)
 	if fileExists(outPath) {
+		r.rememberDecodedCache(path, outPath, ext, cacheKey, info)
 		return outPath, nil
 	}
+	if err := r.writeBytesToCache(outPath, bytes); err != nil {
+		return "", err
+	}
+	r.rememberDecodedCache(path, outPath, ext, cacheKey, info)
+	return outPath, nil
+}
+
+func (r Resolver) lookupDecodedCache(path string) (string, bool) {
+	if !strings.HasSuffix(strings.ToLower(path), ".dat") {
+		return "", false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	manifest, err := r.loadDecodedCacheManifest()
+	if err != nil || len(manifest.Entries) == 0 {
+		return "", false
+	}
+	entry, ok := manifest.Entries[decodedCacheSourceKey(path)]
+	if !ok {
+		return "", false
+	}
+	if entry.SourceSize != info.Size() || entry.SourceMTimeNS != info.ModTime().UnixNano() || entry.CachedPath == "" {
+		return "", false
+	}
+	if !fileExists(entry.CachedPath) {
+		return "", false
+	}
+	return entry.CachedPath, true
+}
+
+func (r Resolver) rememberDecodedCache(path string, outPath string, ext string, cacheKey string, info os.FileInfo) {
+	if !strings.HasSuffix(strings.ToLower(path), ".dat") || outPath == "" || info == nil {
+		return
+	}
+	manifest, _ := r.loadDecodedCacheManifest()
+	if manifest.Entries == nil {
+		manifest.Entries = map[string]decodedCacheEntry{}
+	}
+	sourcePath := decodedCacheSourceKey(path)
+	manifest.Entries[sourcePath] = decodedCacheEntry{
+		SourcePath:    sourcePath,
+		SourceSize:    info.Size(),
+		SourceMTimeNS: info.ModTime().UnixNano(),
+		CacheKey:      cacheKey,
+		Ext:           ext,
+		CachedPath:    outPath,
+		UpdatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	_ = r.writeDecodedCacheManifest(manifest)
+}
+
+func (r Resolver) loadDecodedCacheManifest() (decodedCacheManifest, error) {
+	cacheDir := filepath.Clean(r.CacheDir)
+	decodedCacheManifests.Lock()
+	if manifest, ok := decodedCacheManifests.byDir[cacheDir]; ok {
+		decodedCacheManifests.Unlock()
+		return manifest, nil
+	}
+	decodedCacheManifests.Unlock()
+
+	path := r.decodedCacheManifestPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		manifest := decodedCacheManifest{Entries: map[string]decodedCacheEntry{}}
+		if os.IsNotExist(err) {
+			cacheDecodedCacheManifest(cacheDir, manifest)
+		}
+		return manifest, err
+	}
+	var manifest decodedCacheManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return decodedCacheManifest{Entries: map[string]decodedCacheEntry{}}, err
+	}
+	if manifest.Entries == nil {
+		manifest.Entries = map[string]decodedCacheEntry{}
+	}
+	cacheDecodedCacheManifest(cacheDir, manifest)
+	return manifest, nil
+}
+
+func (r Resolver) writeDecodedCacheManifest(manifest decodedCacheManifest) error {
+	if err := os.MkdirAll(r.CacheDir, 0o700); err != nil {
+		return err
+	}
+	if err := app.ChownForSudo(r.CacheDir); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(r.CacheDir, ".decoded-cache-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write([]byte("\n")); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, r.decodedCacheManifestPath()); err != nil {
+		return err
+	}
+	_ = app.ChownForSudo(r.decodedCacheManifestPath())
+	cacheDecodedCacheManifest(filepath.Clean(r.CacheDir), manifest)
+	return nil
+}
+
+func cacheDecodedCacheManifest(cacheDir string, manifest decodedCacheManifest) {
+	if manifest.Entries == nil {
+		manifest.Entries = map[string]decodedCacheEntry{}
+	}
+	decodedCacheManifests.Lock()
+	decodedCacheManifests.byDir[cacheDir] = manifest
+	decodedCacheManifests.Unlock()
+}
+
+func (r Resolver) decodedCacheManifestPath() string {
+	return filepath.Join(r.CacheDir, ".decoded-cache.json")
+}
+
+func decodedCacheSourceKey(path string) string {
+	return filepath.Clean(path)
+}
+
+func (r Resolver) writeBytesToCache(outPath string, bytes []byte) error {
 	tmp, err := os.CreateTemp(r.CacheDir, filepath.Base(outPath)+".*.tmp")
 	if err != nil {
-		return "", err
+		return err
 	}
 	tmpPath := tmp.Name()
 	defer func() {
@@ -342,16 +508,16 @@ func (r Resolver) writeDecodedToCache(path string, bytes []byte, ext string, cac
 	}()
 	if _, err := tmp.Write(bytes); err != nil {
 		_ = tmp.Close()
-		return "", err
+		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return "", err
+		return err
 	}
 	if err := os.Rename(tmpPath, outPath); err != nil {
-		return "", err
+		return err
 	}
 	_ = app.ChownForSudo(outPath)
-	return outPath, nil
+	return nil
 }
 
 func decryptImageBytes(path string, keys imageKeyMaterial) ([]byte, string, string, error) {

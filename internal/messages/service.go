@@ -176,9 +176,7 @@ func (s Service) List(ctx context.Context, opts QueryOptions) ([]Message, error)
 	})
 	page := paginate(out, opts.Limit, opts.Offset)
 	if opts.MediaResolver != nil {
-		for i := range page {
-			enrichMediaDetail(&page[i], opts.MediaResolver)
-		}
+		EnrichMediaDetails(page, opts.MediaResolver)
 	}
 	return page, nil
 }
@@ -226,9 +224,7 @@ func (s Service) ListByRefs(ctx context.Context, refs []RowRef, opts RefQueryOpt
 		out = append(out, normalizeRow(ref.ChatUsername, ref.TableName, ref.SourceDB, opts.IncludeSource, row))
 	}
 	if opts.MediaResolver != nil {
-		for i := range out {
-			enrichMediaDetail(&out[i], opts.MediaResolver)
-		}
+		EnrichMediaDetails(out, opts.MediaResolver)
 	}
 	return out, nil
 }
@@ -532,8 +528,33 @@ func EnrichMediaDetails(list []Message, mediaResolver *media.Resolver) {
 	if mediaResolver == nil {
 		return
 	}
+	voiceRequests := make([]media.VoiceRequest, 0)
+	voiceIndexes := map[string]int{}
 	for i := range list {
+		if mediaKindForMessageType(list[i].Type, list[i].SubType) == "voice" {
+			key := strconv.Itoa(i)
+			voiceIndexes[key] = i
+			voiceRequests = append(voiceRequests, media.VoiceRequest{
+				Key:          key,
+				ChatUsername: list[i].ChatUsername,
+				LocalID:      list[i].LocalID,
+				ServerID:     list[i].ServerID,
+				RawType:      list[i].RawType,
+			})
+			continue
+		}
 		enrichMediaDetail(&list[i], mediaResolver)
+	}
+	if len(voiceRequests) == 0 {
+		return
+	}
+	results := mediaResolver.ResolveVoices(voiceRequests)
+	for key, info := range results {
+		index, ok := voiceIndexes[key]
+		if !ok {
+			continue
+		}
+		applyMediaInfo(&list[index], info)
 	}
 }
 
@@ -553,6 +574,10 @@ func enrichMediaDetail(msg *Message, mediaResolver *media.Resolver) {
 		return
 	}
 	mediaInfo := mediaResolver.Resolve(kind, msg.ChatUsername, msg.LocalID, msg.ServerID, msg.CreateTime, msg.RawType, msg.RawContent, msg.IsChatroom)
+	applyMediaInfo(msg, mediaInfo)
+}
+
+func applyMediaInfo(msg *Message, mediaInfo media.Info) {
 	if mediaInfo.Status == "" {
 		return
 	}

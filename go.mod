@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/klauspost/compress v1.18.4
+	github.com/sjzar/go-silk v0.0.1
 	modernc.org/sqlite v1.50.1
 )
 

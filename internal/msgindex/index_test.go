@@ -248,6 +248,7 @@ func TestRefreshUsesSessionDeltaBeforeReconcile(t *testing.T) {
 	insertIndexMessageRow(t, db, aliceTable, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "alice second"})
 	insertIndexMessageRow(t, db, bobTable, indexMessageRow{LocalID: 2, SortSeq: 2001, CreateTime: 200, Status: 4, Content: "bob second"})
 	updateIndexSessionRow(t, sessionDB, "alice", indexSessionRow{LastTimestamp: 200, UnreadCount: 1, Summary: "alice second"})
+	updateIndexSessionRow(t, sessionDB, "bob", indexSessionRow{LastTimestamp: 100, UnreadCount: 9, Summary: "bob summary changed without timestamp"})
 	if err := os.Chtimes(db, time.Now().Add(-2*time.Second), time.Now().Add(-2*time.Second)); err != nil {
 		t.Fatal(err)
 	}

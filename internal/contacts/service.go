@@ -145,6 +145,59 @@ ORDER BY COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), username) COLLATE N
 	return contacts, rows.Err()
 }
 
+func (s Service) Lookup(ctx context.Context, username string) (Contact, bool, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return Contact{}, false, fmt.Errorf("username is required")
+	}
+	if err := s.ensureCache(); err != nil {
+		return Contact{}, false, err
+	}
+	query := `
+SELECT
+  COALESCE(id, 0),
+  username,
+  COALESCE(local_type, 0),
+  COALESCE(alias, ''),
+  COALESCE(remark, ''),
+  COALESCE(nick_name, ''),
+  COALESCE(big_head_url, '')
+FROM contact
+WHERE username = ?
+LIMIT 1;
+`
+	db, err := sqlitedb.OpenReadOnly(ctx, s.CacheDB)
+	if err != nil {
+		return Contact{}, false, err
+	}
+	defer db.Close()
+	var (
+		id        int
+		found     string
+		localType int
+		alias     string
+		remark    string
+		nickName  string
+		headURL   string
+	)
+	err = db.QueryRowContext(ctx, query, username).Scan(&id, &found, &localType, &alias, &remark, &nickName, &headURL)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Contact{}, false, nil
+	}
+	if err != nil {
+		return Contact{}, false, fmt.Errorf("query contact by username: %w", err)
+	}
+	ownerUsername := ownerUsernameFromCachePath(s.CacheDB)
+	return Contact{
+		Username: found,
+		Alias:    alias,
+		Remark:   remark,
+		NickName: nickName,
+		HeadURL:  headURL,
+		Kind:     ClassifyKindForAccount(found, localType, id, ownerUsername),
+	}, true, nil
+}
+
 func (s Service) Detail(ctx context.Context, username string) (Detail, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {

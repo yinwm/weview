@@ -53,6 +53,30 @@ INSERT INTO contact VALUES (4, 'gh_x', 1, '', '', 'OA', '');
 	}
 }
 
+func TestLookupReturnsSingleContact(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "contact.db")
+	sql := `
+CREATE TABLE contact (id INTEGER, username TEXT, local_type INTEGER, alias TEXT, remark TEXT, nick_name TEXT, big_head_url TEXT);
+INSERT INTO contact VALUES (1, 'u1', 1, 'alias1', 'Remark 1', 'Nick 1', 'https://example.com/1');
+INSERT INTO contact VALUES (3, '10000@chatroom', 1, '', '', 'Group 1', '');
+`
+	createContactDB(t, db, sql)
+	got, found, err := NewService(db).Lookup(context.Background(), "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || got.Username != "u1" || got.Remark != "Remark 1" || got.Kind != KindFriend {
+		t.Fatalf("lookup = %+v found=%v, want u1 friend", got, found)
+	}
+	_, found, err = NewService(db).Lookup(context.Background(), "missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("missing contact should not be found")
+	}
+}
+
 func TestListClassifiesCurrentAccountAsOther(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "cache", "wxid_self_abcd", "contact")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

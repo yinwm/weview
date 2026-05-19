@@ -2,8 +2,6 @@ package sessions
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"sort"
@@ -46,8 +44,6 @@ type IndexHint struct {
 	Username      string
 	TableName     string
 	LastTimestamp int64
-	UnreadCount   int64
-	SummaryHash   string
 }
 
 type Service struct {
@@ -158,13 +154,10 @@ func (s Service) IndexHints(ctx context.Context) ([]IndexHint, error) {
 		if username == "" || row.LastTimestamp <= 0 {
 			continue
 		}
-		sum := sha256.Sum256(row.Summary)
 		out = append(out, IndexHint{
 			Username:      username,
 			TableName:     messages.TableName(username),
 			LastTimestamp: row.LastTimestamp,
-			UnreadCount:   row.UnreadCount,
-			SummaryHash:   hex.EncodeToString(sum[:]),
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {

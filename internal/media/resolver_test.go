@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"wxview/internal/sqlitedb/sqlitetest"
 )
@@ -144,6 +145,39 @@ func TestResolverAddsDirectImagePath(t *testing.T) {
 	}
 }
 
+func TestResolveImageUsesDecodedCacheBeforeDecrypt(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "wxid_owner_bcc2", "db_storage")
+	chat := "alice"
+	imageDir := filepath.Join(dir, "wxid_owner_bcc2", "Message", "MessageTemp", md5Hex(chat), "Image")
+	if err := os.MkdirAll(imageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	imagePath := filepath.Join(imageDir, "71700000000.dat")
+	raw := []byte{0xff, 0xd8, 0xff, 'j', 'p', 'g'}
+	if err := os.WriteFile(imagePath, xorBytes(raw, 0x55), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixedTime := time.Unix(1700000000, 0)
+	if err := os.Chtimes(imagePath, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := NewResolver(dataDir, filepath.Join(dir, "cache"))
+	first := resolver.ResolveImage(chat, 7, 1700000000, 3, "<msg><img /></msg>", false)
+	if first.Status != "resolved" || first.Path == "" || !first.Decoded {
+		t.Fatalf("unexpected first image info: %+v", first)
+	}
+	corruptFilePreservingTime(t, imagePath, fixedTime)
+	second := resolver.ResolveImage(chat, 7, 1700000000, 3, "<msg><img /></msg>", false)
+	if second.Status != "resolved" || second.Path != first.Path || !second.Decoded {
+		t.Fatalf("decoded image cache was not used: first=%+v second=%+v", first, second)
+	}
+}
+
 func TestResolverAddsDirectVideoPathAndThumbnail(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "wxid_owner_bcc2", "db_storage")
@@ -168,6 +202,39 @@ func TestResolverAddsDirectVideoPathAndThumbnail(t *testing.T) {
 	}
 	if !info.Thumbnail || info.ThumbnailPath != thumbPath || info.Width != 4 || info.Height != 5 {
 		t.Fatalf("unexpected video thumbnail: %+v", info)
+	}
+}
+
+func TestResolveVideoUsesDecodedCacheBeforeDecrypt(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "wxid_owner_bcc2", "db_storage")
+	chat := "alice"
+	videoDir := filepath.Join(dir, "wxid_owner_bcc2", "Message", "MessageTemp", md5Hex(chat), "Video")
+	if err := os.MkdirAll(videoDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	videoPath := filepath.Join(videoDir, "71700000000.dat")
+	raw := testMP4Bytes()
+	if err := os.WriteFile(videoPath, xorBytes(raw, 0x33), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixedTime := time.Unix(1700000000, 0)
+	if err := os.Chtimes(videoPath, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := NewResolver(dataDir, filepath.Join(dir, "cache"))
+	first := resolver.ResolveVideo(chat, 7, 1700000000, 43, `<msg><videomsg length="24" /></msg>`, false)
+	if first.Status != "resolved" || first.Path == "" || !first.Decoded {
+		t.Fatalf("unexpected first video info: %+v", first)
+	}
+	corruptFilePreservingTime(t, videoPath, fixedTime)
+	second := resolver.ResolveVideo(chat, 7, 1700000000, 43, `<msg><videomsg length="24" /></msg>`, false)
+	if second.Status != "resolved" || second.Path != first.Path || !second.Decoded {
+		t.Fatalf("decoded video cache was not used: first=%+v second=%+v", first, second)
 	}
 }
 
@@ -225,6 +292,7 @@ func TestResolveFilePathMacOS4(t *testing.T) {
 }
 
 func TestResolveVoiceFromMediaDB(t *testing.T) {
+	stubVoiceWAVEncoder(t)
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "wxid_owner_bcc2", "db_storage")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -247,9 +315,102 @@ INSERT INTO VoiceInfo(chat_name_id, local_id, svr_id, voice_data) VALUES (9, 7, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.HasPrefix(data, []byte("#!SILK_V3")) {
-		t.Fatalf("voice silk prefix was not normalized: %x", data)
+	if !bytes.HasPrefix(data, []byte("RIFF")) || filepath.Ext(info.Path) != ".wav" || !info.Decoded {
+		t.Fatalf("voice was not exported as decoded wav: info=%+v data=%x", info, data)
 	}
+}
+
+func TestResolveVoiceUsesCachedWAVBeforeTranscoding(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "wxid_owner_bcc2", "db_storage")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mediaDB := filepath.Join(dir, "media_0.db")
+	sql := `
+CREATE TABLE Name2Id(user_name TEXT);
+INSERT INTO Name2Id(rowid, user_name) VALUES (9, 'alice');
+CREATE TABLE VoiceInfo(chat_name_id INTEGER, local_id INTEGER, svr_id INTEGER, voice_data BLOB);
+INSERT INTO VoiceInfo(chat_name_id, local_id, svr_id, voice_data) VALUES (9, 7, 0, X'02232153494C4B5F5633616263');
+`
+	createMediaTestDB(t, mediaDB, sql)
+
+	old := voiceWAVEncoder
+	calls := 0
+	voiceWAVEncoder = func(data []byte) ([]byte, error) {
+		calls++
+		return append([]byte("RIFF"), data...), nil
+	}
+	t.Cleanup(func() {
+		voiceWAVEncoder = old
+	})
+
+	resolver := NewResolver(dataDir, filepath.Join(dir, "cache"), mediaDB)
+	first := resolver.ResolveVoice("alice", 7, 0, 34)
+	second := resolver.ResolveVoice("alice", 7, 0, 34)
+	if first.Status != "resolved" || second.Status != "resolved" || first.Path == "" || first.Path != second.Path {
+		t.Fatalf("unexpected cached voice results: first=%+v second=%+v", first, second)
+	}
+	if calls != 1 {
+		t.Fatalf("voice encoder calls = %d, want 1", calls)
+	}
+}
+
+func TestResolveVoicesBatchFromMediaDB(t *testing.T) {
+	stubVoiceWAVEncoder(t)
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "wxid_owner_bcc2", "db_storage")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mediaDB := filepath.Join(dir, "media_0.db")
+	sql := `
+CREATE TABLE Name2Id(user_name TEXT);
+INSERT INTO Name2Id(rowid, user_name) VALUES (9, 'alice');
+CREATE TABLE VoiceInfo(chat_name_id INTEGER, local_id INTEGER, svr_id INTEGER, voice_data BLOB);
+INSERT INTO VoiceInfo(chat_name_id, local_id, svr_id, voice_data) VALUES (9, 7, 0, X'02232153494C4B5F5633616263');
+INSERT INTO VoiceInfo(chat_name_id, local_id, svr_id, voice_data) VALUES (9, 8, 123, X'02232153494C4B5F5633646566');
+`
+	createMediaTestDB(t, mediaDB, sql)
+	resolver := NewResolver(dataDir, filepath.Join(dir, "cache"), mediaDB)
+	got := resolver.ResolveVoices([]VoiceRequest{
+		{Key: "local", ChatUsername: "alice", LocalID: 7, RawType: 34},
+		{Key: "server", ChatUsername: "alice", LocalID: 8, ServerID: 123, RawType: 34},
+	})
+	if got["local"].Status != "resolved" || got["server"].Status != "resolved" {
+		t.Fatalf("batch voice results = %+v, want both resolved", got)
+	}
+	if filepath.Ext(got["local"].Path) != ".wav" || filepath.Ext(got["server"].Path) != ".wav" {
+		t.Fatalf("batch voice paths = %+v, want wav files", got)
+	}
+}
+
+func TestNormalizeSilkPayloadStripsWechatPrefix(t *testing.T) {
+	got, err := normalizeSilkPayload([]byte{0x00, 0xff, 0x02, '#', '!', 'S', 'I', 'L', 'K', '_', 'V', '3'})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("#!SILK_V3")) {
+		t.Fatalf("normalized payload = %q, want silk header", got)
+	}
+}
+
+func stubVoiceWAVEncoder(t *testing.T) {
+	t.Helper()
+	old := voiceWAVEncoder
+	voiceWAVEncoder = func(data []byte) ([]byte, error) {
+		normalized, err := normalizeSilkPayload(data)
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.HasPrefix(normalized, []byte("#!SILK_V3")) {
+			t.Fatalf("voice encoder received non-silk payload: %x", data)
+		}
+		return append([]byte("RIFF"), normalized...), nil
+	}
+	t.Cleanup(func() {
+		voiceWAVEncoder = old
+	})
 }
 
 func TestResolveAvatarFromHeadImageDB(t *testing.T) {
@@ -314,6 +475,21 @@ func writeTestPNG(t *testing.T, path string, width int, height int) {
 func writeTestMP4(t *testing.T, path string) {
 	t.Helper()
 	if err := os.WriteFile(path, testMP4Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func corruptFilePreservingTime(t *testing.T, path string, modTime time.Time) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte{0}, int(info.Size()))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, modTime, modTime); err != nil {
 		t.Fatal(err)
 	}
 }
