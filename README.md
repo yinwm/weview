@@ -324,9 +324,42 @@ daemon 是内部缓存维护服务，不是公开 API：
 
 `wxview init` 需要读取正在运行的微信进程内存来获取数据库 key：
 
-- macOS 通常需要 `sudo`，并确保终端有 Full Disk Access。
+- macOS 通常需要 `sudo`；执行 `wxview` 命令的终端程序也需要能访问微信数据目录，
+  必要时授予 Full Disk Access。
 - Windows 需要管理员终端。
 - 如果 macOS 报 `task_for_pid failed`，通常是系统权限、签名或 Hardened Runtime 限制。
+
+### macOS `task_for_pid failed`
+
+`task_for_pid failed` 表示 Wxview 没有拿到读取 WeChat 进程内存的权限。先检查
+WeChat.app 当前签名状态：
+
+```sh
+codesign -dv /Applications/WeChat.app 2>&1 | grep -E "Signature|flags"
+```
+
+- 如果看到 `flags=0x2(adhoc)` 或 `Signature=adhoc`，WeChat 已是 ad-hoc
+  签名，通常重新用 `sudo ./bin/wxview init` 即可。
+- 如果看到 `flags=0x10000(runtime)`，说明是带 Hardened Runtime 的官方签名。
+  实际执行命令的本机 GUI 终端程序加 `sudo` 通常可以触发系统授权；SSH 会话通常拿不到这个
+  Developer Tools 授权。
+- 如果确实需要在本机研究环境下稳定提取 key，可以先退出 WeChat，重签名为
+  ad-hoc，再重新打开 WeChat 登录后运行 `init`：
+
+```sh
+killall WeChat
+sudo xattr -cr /Applications/WeChat.app
+sudo codesign --force --deep --sign - /Applications/WeChat.app
+open /Applications/WeChat.app
+sudo ./bin/wxview init
+```
+
+这会修改 `/Applications/WeChat.app`。重签名后可能需要重新登录，微信更新后可能恢复官方签名，
+部分小程序或签名校验能力也可能受影响。只在自己的机器和有权处理的数据范围内使用。
+
+如果 `codesign` 报 `Operation not permitted`，说明执行 `codesign` 命令的终端程序没有修改
+`/Applications` 的权限。给实际执行命令的终端程序授予 Full Disk Access；如果从 SSH 操作，
+还需要给 `/usr/sbin/sshd` 和 `/usr/libexec/sshd-keygen-wrapper` 授权，并重新连接 SSH。
 
 Wxview 不会打印完整 DB key。`init --verbose` 只显示短 fingerprint 和逐库状态。
 
